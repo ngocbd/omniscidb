@@ -1,7 +1,25 @@
+/*
+ * Copyright 2020 OmniSci, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 
+#include "DataMgr/ForeignStorage/ForeignDataWrapperShared.h"
+#include "DataMgr/ForeignStorage/ForeignTableSchema.h"
+#include "Geospatial/Types.h"
 #include "ImportExport/DelimitedParserUtils.h"
-#include "Shared/geo_types.h"
 #include "Shared/misc.h"
 
 namespace foreign_storage {
@@ -33,19 +51,18 @@ void set_array_flags_and_geo_columns_count(
 
 void validate_expected_column_count(std::vector<std::string_view>& row,
                                     size_t num_cols,
-                                    int point_cols) {
+                                    int point_cols,
+                                    const std::string& file_name) {
   // Each POINT could consume two separate coords instead of a single WKT
   if (row.size() < num_cols || (num_cols + point_cols) < row.size()) {
-    std::stringstream string_stream;
-    string_stream << "Incorrect Row (expected " << num_cols << " columns, has "
-                  << row.size() << "): " << shared::printContainer(row);
-    LOG(ERROR) << string_stream.str();
-    throw std::runtime_error{string_stream.str()};
+    throw_number_of_columns_mismatch_error(num_cols, row.size(), file_name);
   }
 }
 
 bool is_coordinate_scalar(const std::string_view datum) {
-  return datum.size() > 0 && (datum[0] == '.' || isdigit(datum[0]) || datum[0] == '-');
+  // field looks like a scalar numeric value (and not a hex blob)
+  return datum.size() > 0 && (datum[0] == '.' || isdigit(datum[0]) || datum[0] == '-') &&
+         datum.find_first_of("ABCDEFabcdef") == std::string_view::npos;
 }
 
 bool set_coordinates_from_separate_lon_lat_columns(const std::string_view lon_str,
@@ -114,7 +131,7 @@ void process_geo_column(
   // store null string in the base column
   import_buffers[col_idx]->add_value(cd, copy_params.null_str, true, copy_params);
 
-  auto const& wkt = row[import_idx];
+  auto const& geo_string = row[import_idx];
   ++import_idx;
   ++col_idx;
 
@@ -124,9 +141,9 @@ void process_geo_column(
   std::vector<int> poly_rings;
   int render_group = 0;
 
-  if (!is_null && col_type == kPOINT && is_coordinate_scalar(wkt)) {
+  if (!is_null && col_type == kPOINT && is_coordinate_scalar(geo_string)) {
     if (!set_coordinates_from_separate_lon_lat_columns(
-            wkt, row[import_idx], coords, copy_params.lonlat)) {
+            geo_string, row[import_idx], coords, copy_params.lonlat)) {
       throw std::runtime_error("Cannot read lon/lat to insert into POINT column " +
                                cd->columnName);
     }
@@ -134,22 +151,21 @@ void process_geo_column(
   } else {
     SQLTypeInfo import_ti{col_ti};
     if (is_null) {
-      Geo_namespace::GeoTypesFactory::getNullGeoColumns(import_ti,
-                                                        coords,
-                                                        bounds,
-                                                        ring_sizes,
-                                                        poly_rings,
-                                                        PROMOTE_POLYGON_TO_MULTIPOLYGON);
+      Geospatial::GeoTypesFactory::getNullGeoColumns(import_ti,
+                                                     coords,
+                                                     bounds,
+                                                     ring_sizes,
+                                                     poly_rings,
+                                                     PROMOTE_POLYGON_TO_MULTIPOLYGON);
     } else {
       // extract geometry directly from WKT
-      if (!Geo_namespace::GeoTypesFactory::getGeoColumns(
-              std::string(wkt),
-              import_ti,
-              coords,
-              bounds,
-              ring_sizes,
-              poly_rings,
-              PROMOTE_POLYGON_TO_MULTIPOLYGON)) {
+      if (!Geospatial::GeoTypesFactory::getGeoColumns(std::string(geo_string),
+                                                      import_ti,
+                                                      coords,
+                                                      bounds,
+                                                      ring_sizes,
+                                                      poly_rings,
+                                                      PROMOTE_POLYGON_TO_MULTIPOLYGON)) {
         std::string msg = "Failed to extract valid geometry from row " +
                           std::to_string(first_row_index + row_index_plus_one) +
                           " for column " + cd->columnName;
@@ -178,11 +194,6 @@ void process_geo_column(
                                                           ring_sizes,
                                                           poly_rings,
                                                           render_group);
-
-  // skip remaining physical columns
-  for (int i = 0; i < cd->columnType.get_physical_cols(); ++i) {
-    ++cd_it;
-  }
 }
 
 std::map<int, DataBlockPtr> convert_import_buffers_to_data_blocks(
@@ -193,6 +204,8 @@ std::map<int, DataBlockPtr> convert_import_buffers_to_data_blocks(
       encoded_data_block_ptrs_futures;
   // make all async calls to string dictionary here and then continue execution
   for (const auto& import_buffer : import_buffers) {
+    if (import_buffer == nullptr)
+      continue;
     DataBlockPtr p;
     if (import_buffer->getTypeInfo().is_number() ||
         import_buffer->getTypeInfo().is_time() ||
@@ -238,32 +251,91 @@ std::map<int, DataBlockPtr> convert_import_buffers_to_data_blocks(
 }
 
 struct ParseBufferRequest {
-  ParseBufferRequest() {}
-  ParseBufferRequest(const ParseBufferRequest& request) { UNREACHABLE(); }
+  ParseBufferRequest(const ParseBufferRequest& request) = delete;
   ParseBufferRequest(ParseBufferRequest&& request) = default;
+  ParseBufferRequest(size_t buffer_size,
+                     const import_export::CopyParams& copy_params,
+                     int db_id,
+                     const ForeignTable* foreign_table,
+                     std::set<int> column_filter_set = {})
+      : buffer(std::make_unique<char[]>(buffer_size))
+      , buffer_size(buffer_size)
+      , buffer_alloc_size(buffer_size)
+      , copy_params(copy_params)
+      , db_id(db_id)
+      , foreign_table_schema(std::make_unique<ForeignTableSchema>(db_id, foreign_table)) {
+    // initialize import buffers from columns.
+    for (const auto column : getColumns()) {
+      if (column_filter_set.size() &&
+          column_filter_set.find(column->columnId) == column_filter_set.end()) {
+        import_buffers.emplace_back(nullptr);
+      } else {
+        StringDictionary* string_dictionary = nullptr;
+        if (column->columnType.is_dict_encoded_string() ||
+            (column->columnType.is_array() &&
+             IS_STRING(column->columnType.get_subtype()) &&
+             column->columnType.get_compression() == kENCODING_DICT)) {
+          auto dict_descriptor = getCatalog()->getMetadataForDictUnlocked(
+              column->columnType.get_comp_param(), true);
+          string_dictionary = dict_descriptor->stringDict.get();
+        }
+        import_buffers.emplace_back(std::make_unique<import_export::TypedImportBuffer>(
+            column, string_dictionary));
+      }
+    }
+  }
 
+  inline std::shared_ptr<Catalog_Namespace::Catalog> getCatalog() const {
+    return Catalog_Namespace::Catalog::checkedGet(db_id);
+  }
+
+  inline std::list<const ColumnDescriptor*> getColumns() const {
+    return foreign_table_schema->getLogicalAndPhysicalColumns();
+  }
+
+  inline int32_t getTableId() const {
+    return foreign_table_schema->getForeignTable()->tableId;
+  }
+
+  inline std::string getTableName() const {
+    return foreign_table_schema->getForeignTable()->tableName;
+  }
+
+  inline size_t getMaxFragRows() const {
+    return foreign_table_schema->getForeignTable()->maxFragRows;
+  }
+
+  inline std::string getFilePath() const {
+    return foreign_table_schema->getForeignTable()->getFilePath();
+  }
+
+  // These must be initialized at construction (before parsing).
   std::unique_ptr<char[]> buffer;
   size_t buffer_size;
+  size_t buffer_alloc_size;
+  const import_export::CopyParams copy_params;
+  const int db_id;
+  std::unique_ptr<ForeignTableSchema> foreign_table_schema;
+  std::vector<std::unique_ptr<import_export::TypedImportBuffer>> import_buffers;
+
+  // These are set during parsing.
   size_t buffer_row_count;
   size_t begin_pos;
   size_t end_pos;
   size_t first_row_index;
   size_t file_offset;
-  import_export::CopyParams copy_params;
-  std::list<const ColumnDescriptor*> columns;
-  std::vector<std::unique_ptr<import_export::TypedImportBuffer>> import_buffers;
-  std::shared_ptr<Catalog_Namespace::Catalog> catalog;
-  int db_id;
-  int32_t table_id;
-  size_t max_fragment_rows;
   size_t process_row_count;
 };
 
 struct ParseBufferResult {
-  std::map<int, DataBlockPtr> data_blocks;
+  std::map<int, DataBlockPtr> column_id_to_data_blocks_map;
   size_t row_count;
   std::vector<size_t> row_offsets;
 };
+
+bool skip_column_import(ParseBufferRequest& request, int column_idx) {
+  return request.import_buffers[column_idx] == nullptr;
+}
 
 /**
  * Parses a given CSV file buffer and returns data blocks for each column in the
@@ -286,14 +358,15 @@ ParseBufferResult parse_buffer(ParseBufferRequest& request) {
   std::unique_ptr<bool[]> array_flags;
 
   set_array_flags_and_geo_columns_count(
-      array_flags, phys_cols, point_cols, request.columns);
-  auto num_cols = request.columns.size() - phys_cols;
+      array_flags, phys_cols, point_cols, request.getColumns());
+  auto num_cols = request.getColumns().size() - phys_cols;
 
   size_t row_count = 0;
   size_t remaining_row_count = request.process_row_count;
   std::vector<size_t> row_offsets{};
   row_offsets.emplace_back(request.file_offset + (p - request.buffer.get()));
 
+  std::string file_path = request.getFilePath();
   for (; p < thread_buf_end && remaining_row_count > 0; p++, remaining_row_count--) {
     row.clear();
     row_count++;
@@ -310,31 +383,48 @@ ParseBufferResult parse_buffer(ParseBufferRequest& request) {
                                                  try_single_thread);
 
     row_index_plus_one++;
-    validate_expected_column_count(row, num_cols, point_cols);
+    validate_expected_column_count(row, num_cols, point_cols, file_path);
 
     size_t import_idx = 0;
     size_t col_idx = 0;
     try {
-      for (auto cd_it = request.columns.begin(); cd_it != request.columns.end();
-           cd_it++) {
+      auto columns = request.getColumns();
+      for (auto cd_it = columns.begin(); cd_it != columns.end(); cd_it++) {
         auto cd = *cd_it;
         const auto& col_ti = cd->columnType;
         bool is_null = is_null_datum(row[import_idx], cd, request.copy_params.null_str);
 
         if (col_ti.is_geometry()) {
-          process_geo_column(request.import_buffers,
-                             col_idx,
-                             request.copy_params,
-                             cd_it,
-                             row,
-                             import_idx,
-                             is_null,
-                             request.first_row_index,
-                             row_index_plus_one,
-                             request.catalog);
+          if (!skip_column_import(request, col_idx)) {
+            process_geo_column(request.import_buffers,
+                               col_idx,
+                               request.copy_params,
+                               cd_it,
+                               row,
+                               import_idx,
+                               is_null,
+                               request.first_row_index,
+                               row_index_plus_one,
+                               request.getCatalog());
+          } else {
+            // update import/col idx according to types
+            if (!is_null && cd->columnType == kPOINT &&
+                is_coordinate_scalar(row[import_idx])) {
+              ++import_idx;
+            }
+            ++import_idx;
+            ++col_idx;
+            col_idx += col_ti.get_physical_cols();
+          }
+          // skip remaining physical columns
+          for (int i = 0; i < cd->columnType.get_physical_cols(); ++i) {
+            ++cd_it;
+          }
         } else {
-          request.import_buffers[col_idx]->add_value(
-              cd, row[import_idx], is_null, request.copy_params);
+          if (!skip_column_import(request, col_idx)) {
+            request.import_buffers[col_idx]->add_value(
+                cd, row[import_idx], is_null, request.copy_params);
+          }
           ++import_idx;
           ++col_idx;
         }
@@ -353,8 +443,10 @@ ParseBufferResult parse_buffer(ParseBufferRequest& request) {
   ParseBufferResult result{};
   result.row_offsets = row_offsets;
   result.row_count = row_count;
-  result.data_blocks = convert_import_buffers_to_data_blocks(request.import_buffers);
+  result.column_id_to_data_blocks_map =
+      convert_import_buffers_to_data_blocks(request.import_buffers);
   return result;
 }
+
 }  // namespace csv_file_buffer_parser
 }  // namespace foreign_storage

@@ -28,7 +28,7 @@
 #include "RuntimeFunctions.h"
 
 #include "../Shared/sqltypes.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
@@ -128,7 +128,8 @@ class GroupByAndAggregate {
                       const ExecutorDeviceType device_type,
                       const RelAlgExecutionUnit& ra_exe_unit,
                       const std::vector<InputTableInfo>& query_infos,
-                      std::shared_ptr<RowSetMemoryOwner>);
+                      std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+                      const std::optional<int64_t>& group_cardinality_estimation);
 
   // returns true iff checking the error code after every row
   // is required -- slow path group by queries for now
@@ -294,6 +295,8 @@ class GroupByAndAggregate {
   bool output_columnar_;
   const ExecutorDeviceType device_type_;
 
+  const std::optional<int64_t> group_cardinality_estimation_;
+
   friend class Executor;
   friend class QueryMemoryDescriptor;
   friend class CodeGenerator;
@@ -350,23 +353,10 @@ inline size_t get_count_distinct_sub_bitmap_count(const size_t bitmap_sz_bits,
 }
 
 template <class T>
-inline std::vector<int8_t> get_col_byte_widths(
-    const T& col_expr_list,
-    const std::vector<ssize_t>& col_exprs_to_not_project) {
-  // Note that non-projected col exprs could be projected cols that we can lazy fetch or
-  // grouped cols with keyless hash
-  if (!col_exprs_to_not_project.empty()) {
-    CHECK_EQ(col_expr_list.size(), col_exprs_to_not_project.size());
-  }
+inline std::vector<int8_t> get_col_byte_widths(const T& col_expr_list) {
   std::vector<int8_t> col_widths;
   size_t col_expr_idx = 0;
   for (const auto col_expr : col_expr_list) {
-    if (!col_exprs_to_not_project.empty() &&
-        col_exprs_to_not_project[col_expr_idx] != -1) {
-      col_widths.push_back(0);
-      ++col_expr_idx;
-      continue;
-    }
     if (!col_expr) {
       // row index
       col_widths.push_back(sizeof(int64_t));

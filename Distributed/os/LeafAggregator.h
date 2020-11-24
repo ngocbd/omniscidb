@@ -18,13 +18,14 @@
 #define LEAFAGGREGATOR_H
 
 #include "../AggregatedResult.h"
+#include "Catalog/Catalog.h"
 #include "DataMgr/MemoryLevel.h"
 #include "LeafHostInfo.h"
 #include "QueryEngine/CompilationOptions.h"
 #include "QueryEngine/TargetMetaInfo.h"
 #include "gen-cpp/OmniSci.h"
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 namespace Catalog_Namespace {
 class SessionInfo;
@@ -38,7 +39,8 @@ class LeafAggregator {
 
   AggregatedResult execute(const Catalog_Namespace::SessionInfo& parent_session_info,
                            const std::string& query_ra,
-                           const ExecutionOptions& eo) {
+                           const ExecutionOptions& eo,
+                           const bool is_update_delete) {
     CHECK(false);
     return {nullptr, {}};
   }
@@ -69,9 +71,10 @@ class LeafAggregator {
     CHECK(false);
   }
 
-  void checkpointLeaf(const Catalog_Namespace::SessionInfo& parent_session_info,
-                      const int32_t db_id,
-                      const int32_t table_id) {
+  void checkpointLeafShardsWithAutoRollback(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const int32_t table_id) {
     CHECK(false);
   }
 
@@ -86,6 +89,21 @@ class LeafAggregator {
                            const int32_t db_id,
                            const int32_t table_id,
                            const int32_t new_epoch) {
+    CHECK(false);
+  }
+
+  std::vector<Catalog_Namespace::TableEpochInfo> getLeafTableEpochs(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const int32_t table_id) {
+    CHECK(false);
+    return {};
+  }
+
+  void setLeafTableEpochs(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const std::vector<Catalog_Namespace::TableEpochInfo>& table_epochs) {
     CHECK(false);
   }
 

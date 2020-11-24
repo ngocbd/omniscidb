@@ -19,7 +19,9 @@
 #include "Calcite/Calcite.h"
 #include "Catalog/Catalog.h"
 #include "DistributedLoader.h"
+#include "Geospatial/Transforms.h"
 #include "ImportExport/CopyParams.h"
+#include "Logger/Logger.h"
 #include "Parser/ParserWrapper.h"
 #include "Parser/parser.h"
 #include "QueryEngine/CalciteAdapter.h"
@@ -27,11 +29,10 @@
 #include "QueryEngine/QueryDispatchQueue.h"
 #include "QueryEngine/RelAlgExecutor.h"
 #include "QueryEngine/TableFunctions/TableFunctionsFactory.h"
-#include "Shared/Logger.h"
 #include "Shared/StringTransform.h"
 #include "Shared/SystemParameters.h"
-#include "Shared/geosupport.h"
 #include "Shared/import_helpers.h"
+#include "TestProcessSignalHandler.h"
 #include "bcrypt.h"
 #include "gen-cpp/CalciteServer.h"
 
@@ -47,6 +48,7 @@ extern bool g_enable_filter_push_down;
 double g_gpu_mem_limit_percent{0.9};
 
 extern bool g_serialize_temp_tables;
+bool g_enable_calcite_view_optimize{true};
 std::mutex calcite_lock;
 
 using namespace Catalog_Namespace;
@@ -61,23 +63,9 @@ void calcite_shutdown_handler() noexcept {
   }
 }
 
-void mapd_signal_handler(int signal_number) {
-  LOG(ERROR) << "Interrupt signal (" << signal_number << ") received.";
-  calcite_shutdown_handler();
-  // shut down logging force a flush
-  logger::shutdown();
-  // terminate program
-  if (signal_number == SIGTERM) {
-    std::exit(EXIT_SUCCESS);
-  } else {
-    std::exit(signal_number);
-  }
-}
-
-void register_signal_handler() {
-  std::signal(SIGTERM, mapd_signal_handler);
-  std::signal(SIGSEGV, mapd_signal_handler);
-  std::signal(SIGABRT, mapd_signal_handler);
+void setup_signal_handler() {
+  TestProcessSignalHandler::registerSignalHandler();
+  TestProcessSignalHandler::addShutdownCallback(calcite_shutdown_handler);
 }
 
 }  // namespace
@@ -137,13 +125,15 @@ QueryRunner::QueryRunner(const char* db_path,
   auto system_db_file = base_path / "mapd_catalogs" / OMNISCI_DEFAULT_DB;
   CHECK(boost::filesystem::exists(system_db_file));
   auto data_dir = base_path / "mapd_data";
+  DiskCacheConfig disk_cache_config{(base_path / "omnisci_disk_cache").string(),
+                                    DiskCacheLevel::fsi};
   Catalog_Namespace::UserMetadata user;
   Catalog_Namespace::DBMetadata db;
 
-  register_signal_handler();
+  setup_signal_handler();
   logger::set_once_fatal_func(&calcite_shutdown_handler);
   g_calcite =
-      std::make_shared<Calcite>(-1, CALCITEPORT, db_path, 1024, 5000, udf_filename);
+      std::make_shared<Calcite>(-1, CALCITEPORT, db_path, 1024, 5000, true, udf_filename);
   ExtensionFunctionsWhitelist::add(g_calcite->getExtensionFunctionWhitelist());
   if (!udf_filename.empty()) {
     ExtensionFunctionsWhitelist::addUdfs(g_calcite->getUserDefinedFunctionWhitelist());
@@ -151,15 +141,25 @@ QueryRunner::QueryRunner(const char* db_path,
 
   table_functions::TableFunctionsFactory::init();
 
-#ifndef HAVE_CUDA
+  std::unique_ptr<CudaMgr_Namespace::CudaMgr> cuda_mgr;
+#ifdef HAVE_CUDA
+  if (uses_gpus) {
+    cuda_mgr = std::make_unique<CudaMgr_Namespace::CudaMgr>(-1, 0);
+  }
+#else
   uses_gpus = false;
 #endif
   SystemParameters mapd_params;
   mapd_params.gpu_buffer_mem_bytes = max_gpu_mem;
   mapd_params.aggregator = !leaf_servers.empty();
 
-  auto data_mgr = std::make_shared<Data_Namespace::DataMgr>(
-      data_dir.string(), mapd_params, uses_gpus, -1, 0, reserved_gpu_mem);
+  auto data_mgr = std::make_shared<Data_Namespace::DataMgr>(data_dir.string(),
+                                                            mapd_params,
+                                                            std::move(cuda_mgr),
+                                                            uses_gpus,
+                                                            reserved_gpu_mem,
+                                                            0,
+                                                            disk_cache_config);
 
   auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
 
@@ -333,7 +333,8 @@ std::shared_ptr<ResultSet> QueryRunner::runSQLWithAllowingInterrupt(
     std::shared_ptr<Executor> executor,
     const std::string& session_id,
     const ExecutorDeviceType device_type,
-    const unsigned interrupt_check_freq) {
+    const double running_query_check_freq,
+    const unsigned pending_query_check_freq) {
   CHECK(session_info_);
   CHECK(!Catalog_Namespace::SysCatalog::instance().isAggregator());
   auto session_info =
@@ -359,7 +360,7 @@ std::shared_ptr<ResultSet> QueryRunner::runSQLWithAllowingInterrupt(
                          false,
                          g_gpu_mem_limit_percent,
                          true,
-                         interrupt_check_freq};
+                         pending_query_check_freq};
   std::string query_ra{""};
   {
     // async query initiation for interrupt test
@@ -569,7 +570,7 @@ std::shared_ptr<ExecutionResult> QueryRunner::runSelectQuery(
                                             {},
                                             true,
                                             false,
-                                            false,
+                                            g_enable_calcite_view_optimize,
                                             true)
                                   .plan_result;
         auto ra_executor = RelAlgExecutor(executor.get(), cat, query_ra);
@@ -581,7 +582,7 @@ std::shared_ptr<ExecutionResult> QueryRunner::runSelectQuery(
             ra_executor.executeRelAlgQuery(co, eo, false, nullptr));
       });
   CHECK(dispatch_queue_);
-  dispatch_queue_->submit(query_launch_task);
+  dispatch_queue_->submit(query_launch_task, /*is_update_delete=*/false);
   auto result_future = query_launch_task->get_future();
   result_future.get();
   CHECK(result);
@@ -593,8 +594,7 @@ const std::shared_ptr<std::vector<int32_t>>& QueryRunner::getCachedJoinHashTable
   return JoinHashTable::getCachedHashTable(idx);
 };
 
-const std::shared_ptr<std::vector<int8_t>>& QueryRunner::getCachedBaselineHashTable(
-    size_t idx) {
+const int8_t* QueryRunner::getCachedBaselineHashTable(size_t idx) {
   return BaselineJoinHashTable::getCachedHashTable(idx);
 };
 

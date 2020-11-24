@@ -34,7 +34,6 @@
 #include "Catalog.h"
 
 #include "Catalog/AuthMetadata.h"
-#include "LockMgr/LockMgr.h"
 #include "QueryEngine/ExternalCacheInvalidators.h"
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -123,8 +122,6 @@ void SysCatalog::init(const std::string& basePath,
     basePath_ = basePath;
     dataMgr_ = dataMgr;
     authMetadata_ = &authMetadata;
-    ldap_server_.reset(new LdapServer(*authMetadata_));
-    rest_server_.reset(new RestServer(*authMetadata_));
     pki_server_.reset(new PkiServer(*authMetadata_));
     calciteMgr_ = calcite;
     string_dict_hosts_ = string_dict_hosts;
@@ -197,6 +194,7 @@ void SysCatalog::initDB() {
   }
   sqliteConnector_->query("END TRANSACTION");
   createDatabase(OMNISCI_DEFAULT_DB, OMNISCI_ROOT_USER_ID);
+  createRole_unsafe(OMNISCI_ROOT_USER, true);
 }
 
 void SysCatalog::checkAndExecuteMigrations() {
@@ -208,6 +206,7 @@ void SysCatalog::checkAndExecuteMigrations() {
   updatePasswordsToHashes();
   updateBlankPasswordsToRandom();  // must come after updatePasswordsToHashes()
   updateSupportUserDeactivation();
+  addAdminUserRole();
 }
 
 void SysCatalog::updateUserSchema() {
@@ -319,6 +318,8 @@ void SysCatalog::createUserRoles() {
   sqliteConnector_->query("END TRANSACTION");
 }
 
+namespace {
+
 void deleteObjectPrivileges(std::unique_ptr<SqliteConnector>& sqliteConnector,
                             std::string roleName,
                             bool userRole,
@@ -367,6 +368,8 @@ void insertOrUpdateObjectPrivileges(std::unique_ptr<SqliteConnector>& sqliteConn
           object.getName()                                    // name
       });
 }
+
+}  // namespace
 
 void SysCatalog::migratePrivileges() {
   sys_sqlite_lock sqlite_lock(this);
@@ -474,6 +477,27 @@ void SysCatalog::migratePrivileges() {
         }
       }
     }
+  } catch (const std::exception&) {
+    sqliteConnector_->query("ROLLBACK TRANSACTION");
+    throw;
+  }
+  sqliteConnector_->query("END TRANSACTION");
+}
+
+void SysCatalog::addAdminUserRole() {
+  sys_sqlite_lock sqlite_lock(this);
+  sqliteConnector_->query("BEGIN TRANSACTION");
+  try {
+    sqliteConnector_->query(
+        "SELECT roleName FROM mapd_object_permissions WHERE roleName = \'" +
+        OMNISCI_ROOT_USER + "\'");
+    if (sqliteConnector_->getNumRows() != 0) {
+      // already done
+      sqliteConnector_->query("END TRANSACTION");
+      return;
+    }
+
+    createRole_unsafe(OMNISCI_ROOT_USER, true);
   } catch (const std::exception&) {
     sqliteConnector_->query("ROLLBACK TRANSACTION");
     throw;
@@ -845,6 +869,16 @@ void SysCatalog::dropUser(const string& name) {
     throw;
   }
   sqliteConnector_->query("END TRANSACTION");
+}
+
+std::vector<std::shared_ptr<Catalog>> SysCatalog::getCatalogsForAllDbs() {
+  std::vector<std::shared_ptr<Catalog>> catalogs{};
+  const auto& db_metadata_list = getAllDBMetadata();
+  for (const auto& db_metadata : db_metadata_list) {
+    catalogs.emplace_back(Catalog::get(
+        basePath_, db_metadata, dataMgr_, string_dict_hosts_, calciteMgr_, false));
+  }
+  return catalogs;
 }
 
 namespace {  // anonymous namespace
@@ -1704,7 +1738,7 @@ void SysCatalog::getDBObjectPrivileges(const std::string& granteeName,
 }
 
 void SysCatalog::createRole_unsafe(const std::string& roleName,
-                                   const bool& userPrivateRole) {
+                                   const bool userPrivateRole) {
   sys_write_lock write_lock(this);
 
   auto* grantee = getGrantee(roleName);
@@ -2082,7 +2116,7 @@ void SysCatalog::buildRoleMap() {
   std::vector<std::string> objectKeyStr(4);
   DBObjectKey objectKey;
   AccessPrivileges privs;
-  bool userPrivateRole(false);
+  bool userPrivateRole{false};
   for (size_t r = 0; r < numRows; ++r) {
     std::string roleName = sqliteConnector_->getData<string>(r, 0);
     userPrivateRole = sqliteConnector_->getData<bool>(r, 1);

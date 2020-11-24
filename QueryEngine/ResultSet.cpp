@@ -23,7 +23,6 @@
  */
 
 #include "ResultSet.h"
-
 #include "DataMgr/Allocators/CudaAllocator.h"
 #include "DataMgr/BufferMgr/BufferMgr.h"
 #include "Execute.h"
@@ -43,53 +42,6 @@
 #include <numeric>
 
 extern bool g_use_tbb_pool;
-
-std::vector<int64_t> initialize_target_values_for_storage(
-    const std::vector<TargetInfo>& targets) {
-  std::vector<int64_t> target_init_vals;
-  for (const auto& target_info : targets) {
-    if (target_info.agg_kind == kCOUNT ||
-        target_info.agg_kind == kAPPROX_COUNT_DISTINCT) {
-      target_init_vals.push_back(0);
-      continue;
-    }
-    if (target_info.sql_type.is_column()) {
-      int64_t init_val = null_val_bit_pattern(target_info.sql_type.get_subtype(),
-                                              takes_float_argument(target_info));
-      target_init_vals.push_back(target_info.is_agg ? init_val : 0);
-    } else if (!target_info.sql_type.get_notnull()) {
-      int64_t init_val =
-          null_val_bit_pattern(target_info.sql_type, takes_float_argument(target_info));
-      target_init_vals.push_back(target_info.is_agg ? init_val : 0);
-    } else {
-      target_init_vals.push_back(target_info.is_agg ? 0xdeadbeef : 0);
-    }
-    if (target_info.agg_kind == kAVG) {
-      target_init_vals.push_back(0);
-    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_geometry()) {
-      for (int i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); i++) {
-        target_init_vals.push_back(0);
-      }
-    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_varlen()) {
-      target_init_vals.push_back(0);
-    }
-  }
-  return target_init_vals;
-}
-
-ResultSetStorage::ResultSetStorage(const std::vector<TargetInfo>& targets,
-                                   const QueryMemoryDescriptor& query_mem_desc,
-                                   int8_t* buff,
-                                   const bool buff_is_provided)
-    : targets_(targets)
-    , query_mem_desc_(query_mem_desc)
-    , buff_(buff)
-    , buff_is_provided_(buff_is_provided)
-    , target_init_vals_(initialize_target_values_for_storage(targets)) {}
-
-int8_t* ResultSetStorage::getUnderlyingBuffer() const {
-  return buff_;
-}
 
 void ResultSet::keepFirstN(const size_t n) {
   CHECK_EQ(-1, cached_row_count_);
@@ -337,6 +289,9 @@ size_t ResultSet::rowCount(const bool force_parallel) const {
     return 1;
   }
   if (!permutation_.empty()) {
+    if (drop_first_ > permutation_.size()) {
+      return 0;
+    }
     const auto limited_row_count = keep_first_ + drop_first_;
     return limited_row_count ? std::min(limited_row_count, permutation_.size())
                              : permutation_.size();
@@ -370,7 +325,7 @@ size_t ResultSet::rowCount(const bool force_parallel) const {
 }
 
 void ResultSet::setCachedRowCount(const size_t row_count) const {
-  CHECK(cached_row_count_ == -1 || cached_row_count_ == static_cast<ssize_t>(row_count));
+  CHECK(cached_row_count_ == -1 || cached_row_count_ == static_cast<int64_t>(row_count));
   cached_row_count_ = row_count;
 }
 
@@ -396,7 +351,7 @@ size_t ResultSet::parallelRowCount() const {
          i < worker_count && start_entry < entryCount();
          ++i, start_entry += stride) {
       const auto end_entry = std::min(start_entry + stride, entryCount());
-      counter_threads.append(
+      counter_threads.spawn(
           [this](const size_t start, const size_t end) {
             size_t row_count{0};
             for (size_t i = start; i < end; ++i) {
@@ -518,6 +473,10 @@ QueryMemoryDescriptor ResultSet::fixupQueryMemoryDescriptor(
 void ResultSet::sort(const std::list<Analyzer::OrderEntry>& order_entries,
                      const size_t top_n) {
   auto timer = DEBUG_TIMER(__func__);
+
+  if (!storage_) {
+    return;
+  }
   CHECK_EQ(-1, cached_row_count_);
   CHECK(!targets_.empty());
 #ifdef HAVE_CUDA
@@ -711,7 +670,7 @@ ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::materializeCountDistinctCo
        i < worker_count && start_entry < num_non_empty_entries;
        ++i, start_entry += stride) {
     const auto end_entry = std::min(start_entry + stride, num_non_empty_entries);
-    thread_pool.append(
+    thread_pool.spawn(
         [this](const size_t start,
                const size_t end,
                const Analyzer::OrderEntry& order_entry,
@@ -965,22 +924,6 @@ void ResultSet::radixSortOnCpu(
   }
 }
 
-void ResultSetStorage::addCountDistinctSetPointerMapping(const int64_t remote_ptr,
-                                                         const int64_t ptr) {
-  const auto it_ok = count_distinct_sets_mapping_.emplace(remote_ptr, ptr);
-  CHECK(it_ok.second);
-}
-
-int64_t ResultSetStorage::mappedPtr(const int64_t remote_ptr) const {
-  const auto it = count_distinct_sets_mapping_.find(remote_ptr);
-  // Due to the removal of completely zero bitmaps in a distributed transfer there will be
-  // remote ptr that do not not exists. Return 0 if no pointer found
-  if (it == count_distinct_sets_mapping_.end()) {
-    return int64_t(0);
-  }
-  return it->second;
-}
-
 size_t ResultSet::getLimit() const {
   return keep_first_;
 }
@@ -991,14 +934,6 @@ std::shared_ptr<const std::vector<std::string>> ResultSet::getStringDictionaryPa
   const auto sdp =
       executor_->getStringDictionaryProxy(dict_id, row_set_mem_owner_, false);
   return sdp->getDictionary()->copyStrings();
-}
-
-bool can_use_parallel_algorithms(const ResultSet& rows) {
-  return !rows.isTruncated();
-}
-
-bool use_parallel_algorithms(const ResultSet& rows) {
-  return can_use_parallel_algorithms(rows) && rows.entryCount() >= 20000;
 }
 
 /**
@@ -1090,4 +1025,14 @@ std::vector<size_t> ResultSet::getSlotIndicesForTargetIndices() const {
     slot_index = advance_slot(slot_index, targets_[target_idx], false);
   }
   return slot_indices;
+}
+
+// namespace result_set
+
+bool result_set::can_use_parallel_algorithms(const ResultSet& rows) {
+  return !rows.isTruncated();
+}
+
+bool result_set::use_parallel_algorithms(const ResultSet& rows) {
+  return result_set::can_use_parallel_algorithms(rows) && rows.entryCount() >= 20000;
 }

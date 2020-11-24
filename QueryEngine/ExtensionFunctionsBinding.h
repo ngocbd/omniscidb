@@ -26,6 +26,7 @@
 #define QUERYENGINE_EXTENSIONFUNCTIONSBINDING_H
 
 #include "ExtensionFunctionsWhitelist.h"
+#include "TableFunctions/TableFunctionsFactory.h"
 
 #include "../Analyzer/Analyzer.h"
 #include "../Shared/sqltypes.h"
@@ -37,10 +38,21 @@ class FunctionOper;
 }  // namespace Analyzer
 
 ExtensionFunction bind_function(std::string name,
+                                Analyzer::ExpressionPtrVector func_args,
+                                const bool is_gpu);
+
+ExtensionFunction bind_function(std::string name,
                                 Analyzer::ExpressionPtrVector func_args);
 
-ExtensionFunction bind_function(const Analyzer::FunctionOper* function_oper);
+ExtensionFunction bind_function(const Analyzer::FunctionOper* function_oper,
+                                const bool is_gpu);
 
+const table_functions::TableFunction bind_table_function(
+    std::string name,
+    Analyzer::ExpressionPtrVector input_args,
+    const bool is_gpu);
+
+bool is_ext_arg_type_column(const ExtArgumentType ext_arg_type);
 bool is_ext_arg_type_array(const ExtArgumentType ext_arg_type);
 bool is_ext_arg_type_geo(const ExtArgumentType ext_arg_type);
 #endif  // QUERYENGINE_EXTENSIONFUNCTIONSBINDING_H

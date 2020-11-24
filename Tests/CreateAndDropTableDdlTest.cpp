@@ -33,6 +33,7 @@
 #endif
 
 extern bool g_enable_fsi;
+extern bool g_enable_calcite_ddl_parser;
 
 namespace {
 struct ColumnAttributes {
@@ -701,23 +702,16 @@ TEST_P(CreateTableTest, GeoTypes) {
 }
 
 TEST_P(CreateTableTest, ArrayTypes) {
-  std::string query =
-      getCreateTableQuery(GetParam(),
-                          "test_table",
-                          "(t TINYINT[], t2 TINYINT[1], i INTEGER[], i2 INTEGER[1], bint "
-                          "BIGINT[], bint2 BIGINT[1], "
-                          "txt TEXT[] ENCODING DICT(32), txt2 TEXT[1] ENCODING DICT(32), "
-                          "f FLOAT[], f2 FLOAT[1], "
-                          "d DOUBLE[], d2 DOUBLE[1], dc DECIMAL(18,6)[], dc2 "
-                          "DECIMAL(18,6)[1], b BOOLEAN[], b2 BOOLEAN[1],"
-                          "dt DATE[], dt2 DATE[1], tm TIME[], tm2 TIME[1], tp "
-                          "TIMESTAMP[], tp2 TIMESTAMP[1], p POINT[],"
-                          "ls LINESTRING[], poly POLYGON[], mpoly MULTIPOLYGON[])");
+  std::string query = getCreateTableQuery(
+      GetParam(),
+      "test_table",
+      R"((t TINYINT[], t2 TINYINT[1], i INTEGER[], i2 INTEGER[1], bint BIGINT[], bint2 BIGINT[1], 
+      txt TEXT[] ENCODING DICT(32), txt2 TEXT[1] ENCODING DICT(32), f FLOAT[], f2 FLOAT[1], d DOUBLE[], d2 DOUBLE[1], dc DECIMAL(18,6)[], dc2 DECIMAL(18,6)[1], b BOOLEAN[], b2 BOOLEAN[1], dt DATE[], dt2 DATE[1], tm TIME[], tm2 TIME[1], tp TIMESTAMP[], tp2 TIMESTAMP[1], tp3 TIMESTAMP(3)[], tp4 TIMESTAMP(9)[1]))");
   sql(query);
 
   auto& catalog = getCatalog();
   auto table = catalog.getMetadataForTable("test_table", false);
-  assertTableDetails(table, GetParam(), "test_table", 26);
+  assertTableDetails(table, GetParam(), "test_table", 24);
 
   auto columns = catalog.getAllColumnMetadataForTable(table->tableId, true, true, true);
   auto it = columns.begin();
@@ -916,42 +910,34 @@ TEST_P(CreateTableTest, ArrayTypes) {
   std::advance(it, 1);
   column = *it;
   expected_attributes = {};
-  expected_attributes.column_name = "p";
+  expected_attributes.column_name = "tp3";
+  expected_attributes.size = -1;
   expected_attributes.type = kARRAY;
-  expected_attributes.sub_type = kGEOMETRY;
+  expected_attributes.sub_type = kTIMESTAMP;
+  expected_attributes.precision = 3;
   assertColumnDetails(expected_attributes, column);
 
   std::advance(it, 1);
   column = *it;
   expected_attributes = {};
-  expected_attributes.column_name = "ls";
+  expected_attributes.column_name = "tp4";
+  expected_attributes.size = 8;
   expected_attributes.type = kARRAY;
-  expected_attributes.sub_type = kGEOMETRY;
-  assertColumnDetails(expected_attributes, column);
-
-  std::advance(it, 1);
-  column = *it;
-  expected_attributes = {};
-  expected_attributes.column_name = "poly";
-  expected_attributes.type = kARRAY;
-  expected_attributes.sub_type = kGEOMETRY;
-  assertColumnDetails(expected_attributes, column);
-
-  std::advance(it, 1);
-  column = *it;
-  expected_attributes = {};
-  expected_attributes.column_name = "mpoly";
-  expected_attributes.type = kARRAY;
-  expected_attributes.sub_type = kGEOMETRY;
+  expected_attributes.sub_type = kTIMESTAMP;
+  expected_attributes.precision = 9;
   assertColumnDetails(expected_attributes, column);
 }
 
 TEST_P(CreateTableTest, FixedEncodingForNonNumberOrTimeType) {
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 POINT ENCODING FIXED(8))");
-  queryAndAssertException(
-      query,
-      "Exception: col1: Fixed encoding is only supported for integer or time columns.");
+  if (g_enable_calcite_ddl_parser) {
+    EXPECT_ANY_THROW(sql(query));
+  } else {
+    queryAndAssertException(
+        query,
+        "Exception: col1: Fixed encoding is only supported for integer or time columns.");
+  }
 }
 
 TEST_P(CreateTableTest, DictEncodingNonTextType) {
@@ -995,7 +981,11 @@ TEST_P(CreateTableTest, NonEncodedDictArray) {
 TEST_P(CreateTableTest, FixedLengthArrayOfVarLengthType) {
   std::string query =
       getCreateTableQuery(GetParam(), "test_table", "(col1 LINESTRING[5])");
-  queryAndAssertException(query, "Exception: col1: Unexpected fixed length array size");
+  if (g_enable_calcite_ddl_parser) {
+    EXPECT_ANY_THROW(sql(query));
+  } else {
+    queryAndAssertException(query, "Exception: col1: Unexpected fixed length array size");
+  }
 }
 
 TEST_P(CreateTableTest, UnsupportedTimestampPrecision) {
@@ -1122,7 +1112,9 @@ TEST_P(NegativePrecisionOrDimensionTest, NegativePrecisionOrDimension) {
     if (table_type == ddl_utils::TableType::FOREIGN_TABLE) {
       ASSERT_TRUE(e.error_msg.find("Exception: Parse failed") != std::string::npos);
     } else {
-      ASSERT_EQ("Exception: No negative number in type definition.", e.error_msg);
+      if (!g_enable_calcite_ddl_parser) {
+        ASSERT_EQ("Exception: No negative number in type definition.", e.error_msg);
+      }
     }
   }
 }
@@ -1238,7 +1230,8 @@ TEST_F(CreateForeignTableTest, FsiDisabled) {
   g_enable_fsi = false;
   std::string query = getCreateTableQuery(
       ddl_utils::TableType::FOREIGN_TABLE, "test_foreign_table", "(col1 INTEGER)");
-  queryAndAssertException(query, "Exception: Syntax error at: FOREIGN");
+  // Exception differs depending on which parser is enabled
+  EXPECT_ANY_THROW(sql(query));
 }
 
 class DropTableTest : public CreateAndDropTableDdlTest,
@@ -1312,9 +1305,27 @@ TEST_P(CreateTableTest, InvalidSyntax) {
     if (GetParam() == ddl_utils::TableType::FOREIGN_TABLE) {
       ASSERT_TRUE(e.error_msg.find("Exception: Parse failed") != std::string::npos);
     } else {
-      ASSERT_EQ("Exception: Syntax error at: INTEGER", e.error_msg);
+      if (!g_enable_calcite_ddl_parser) {
+        ASSERT_EQ("Exception: Syntax error at: INTEGER", e.error_msg);
+      }
     }
   }
+}
+
+TEST_P(CreateTableTest, RealAlias) {
+  // TODO(vancouver: support for FSI)
+  if (GetParam() == ddl_utils::TableType::FOREIGN_TABLE) {
+    LOG(ERROR) << "REAL alias not yet supported for FSI.";
+    return;
+  }
+
+  std::string query = getCreateTableQuery(GetParam(), "test_table", "(f REAL)");
+  sql(query);
+  auto td = getCatalog().getMetadataForTable("test_table", false);
+  ASSERT_TRUE(td);
+  auto cd = getCatalog().getMetadataForColumn(td->tableId, "f");
+  ASSERT_TRUE(cd);
+  ASSERT_EQ(cd->columnType.get_type(), kFLOAT);
 }
 
 INSTANTIATE_TEST_SUITE_P(CreateAndDropTableDdlTest,
@@ -1395,6 +1406,30 @@ TEST_F(DropForeignTableTest, FsiDisabled) {
   queryAndAssertException(
       "DROP table test_foreign_table;",
       "Exception: test_foreign_table is a foreign table. Use DROP FOREIGN TABLE.");
+}
+
+class CreateViewUnsupportedTest : public CreateAndDropTableDdlTest {
+ protected:
+  void SetUp() override {
+    CreateAndDropTableDdlTest::SetUp();
+    sql(getDropTableQuery(ddl_utils::TableType::TABLE, "test_table", true));
+    dropTestUser();
+  }
+
+  void TearDown() override {
+    g_enable_fsi = true;
+    sql(getDropTableQuery(ddl_utils::TableType::TABLE, "test_table", true));
+    dropTestUser();
+    CreateAndDropTableDdlTest::TearDown();
+  }
+};
+
+TEST_F(CreateViewUnsupportedTest, Basics) {
+  sql(getCreateTableQuery(
+      ddl_utils::TableType::TABLE, "test_table", "(col1 INTEGER, col2 FLOAT)"));
+  queryAndAssertException(
+      "CREATE VIEW showcreateviewtest (c1, c2) AS SELECT * FROM showcreatetabletest;",
+      "Exception: Parse failed: Column list aliases in views are not yet supported.");
 }
 
 int main(int argc, char** argv) {

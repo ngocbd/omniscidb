@@ -88,7 +88,7 @@ SharedKernelContext::getFragmentResults() {
 }
 
 void ExecutionKernel::run(Executor* executor, SharedKernelContext& shared_context) {
-  DEBUG_TIMER_NEW_THREAD(parent_thread_id);
+  DEBUG_TIMER("ExecutionKernel::run");
   INJECT_TIMER(kernel_run);
   try {
     runImpl(executor, shared_context);
@@ -203,7 +203,8 @@ void ExecutionKernel::runImpl(Executor* executor, SharedKernelContext& shared_co
                                                ExecutorDeviceType::CPU,
                                                ra_exe_unit_,
                                                shared_context.getQueryInfos(),
-                                               executor->row_set_mem_owner_);
+                                               executor->row_set_mem_owner_,
+                                               std::nullopt);
     const auto query_mem_desc =
         group_by_and_aggregate.initQueryMemoryDescriptor(false, 0, 8, nullptr, false);
     device_results_ = run_query_external(

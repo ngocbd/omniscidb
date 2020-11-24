@@ -25,6 +25,7 @@
 
 extern std::unique_ptr<llvm::Module> g_rt_module;
 extern std::unique_ptr<llvm::Module> rt_udf_cpu_module;
+extern std::unique_ptr<llvm::Module> rt_udf_gpu_module;
 
 namespace {
 
@@ -55,10 +56,8 @@ llvm::Function* generate_entry_point(const CgenState* cgen_state) {
   return func;
 }
 
-inline llvm::Type* get_llvm_type_from_sql_column_type(const SQLTypeInfo ti,
+inline llvm::Type* get_llvm_type_from_sql_column_type(const SQLTypeInfo elem_ti,
                                                       llvm::LLVMContext& ctx) {
-  CHECK(ti.is_column());
-  const auto& elem_ti = ti.get_elem_type();
   if (elem_ti.is_fp()) {
     switch (elem_ti.get_size()) {
       case 4:
@@ -66,6 +65,9 @@ inline llvm::Type* get_llvm_type_from_sql_column_type(const SQLTypeInfo ti,
       case 8:
         return llvm::Type::getDoublePtrTy(ctx);
     }
+  }
+  if (elem_ti.is_boolean()) {
+    return llvm::Type::getInt8PtrTy(ctx);
   }
   CHECK(elem_ti.is_integer());
   switch (elem_ti.get_size()) {
@@ -78,8 +80,8 @@ inline llvm::Type* get_llvm_type_from_sql_column_type(const SQLTypeInfo ti,
     case 8:
       return llvm::Type::getInt64PtrTy(ctx);
   }
-
-  UNREACHABLE();
+  LOG(FATAL) << "get_llvm_type_from_sql_column_type: not implemented for "
+             << ::toString(elem_ti);
   return nullptr;
 }
 
@@ -88,7 +90,8 @@ llvm::Value* alloc_column(std::string col_name,
                           llvm::Value* data_ptr,
                           llvm::Value* data_size,
                           llvm::LLVMContext& ctx,
-                          llvm::IRBuilder<>& ir_builder) {
+                          llvm::IRBuilder<>& ir_builder,
+                          bool byval) {
   /*
     Creates a new Column instance of given element type and initialize
     its data ptr and sz members. If data ptr or sz are unspecified
@@ -134,13 +137,22 @@ llvm::Value* alloc_column(std::string col_name,
     auto const_minus1 = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), -1, true);
     ir_builder.CreateStore(const_minus1, col_sz_ptr);
   }
-  return col;
+
+  if (byval) {
+    return ir_builder.CreateLoad(col);
+  } else {
+    auto col_ptr = ir_builder.CreatePointerCast(
+        col_ptr_ptr, llvm::PointerType::get(llvm::Type::getInt8Ty(ctx), 0));
+    col_ptr->setName(col_name + "_ptr");
+    return col_ptr;
+  }
 }
 
 }  // namespace
 
 TableFunctionCompilationContext::TableFunctionCompilationContext()
-    : cgen_state_(std::make_unique<CgenState>(std::vector<InputTableInfo>{}, false)) {
+    : cgen_state_(std::make_unique<CgenState>(/*num_query_infos=*/0,
+                                              /*contains_left_deep_outer_join=*/false)) {
   auto cgen_state = cgen_state_.get();
   CHECK(cgen_state);
 
@@ -187,6 +199,9 @@ void TableFunctionCompilationContext::generateEntryPoint(
       exe_unit.input_exprs.size(), input_cols_arg, cgen_state->ir_builder_, ctx);
   CHECK_EQ(exe_unit.input_exprs.size(), col_heads.size());
 
+  // The column arguments of C++ UDTFs processed by clang must be
+  // passed by reference, see rbc issue 200.
+  auto pass_column_by_value = exe_unit.table_func.isRuntime();
   std::vector<llvm::Value*> func_args;
   for (size_t i = 0; i < exe_unit.input_exprs.size(); i++) {
     const auto& expr = exe_unit.input_exprs[i];
@@ -201,51 +216,38 @@ void TableFunctionCompilationContext::generateEntryPoint(
       func_args.push_back(cgen_state->ir_builder_.CreateLoad(r));
     } else if (ti.is_column()) {
       auto col = alloc_column(std::string("input_col.") + std::to_string(i),
-                              ti,
+                              ti.get_elem_type(),
                               col_heads[i],
                               input_row_count,
                               ctx,
-                              cgen_state_->ir_builder_);
-      func_args.push_back(cgen_state->ir_builder_.CreateLoad(col));
+                              cgen_state_->ir_builder_,
+                              pass_column_by_value);
+      func_args.push_back(col);
     } else {
       throw std::runtime_error(
           "Only integer and floating point columns or scalars are supported as inputs to "
           "table "
-          "functions.");
+          "functions, got " +
+          ti.get_type_name());
     }
   }
-
   std::vector<llvm::Value*> output_col_args;
   for (size_t i = 0; i < exe_unit.target_exprs.size(); i++) {
     auto output_load = cgen_state->ir_builder_.CreateLoad(
         cgen_state->ir_builder_.CreateGEP(output_buffers_arg, cgen_state_->llInt(i)));
     const auto& expr = exe_unit.target_exprs[i];
     const auto& ti = expr->get_type_info();
-    /*
-      How to specify output scalars in C++ code?
-     */
-    if (ti.is_fp()) {
-      func_args.push_back(cgen_state->ir_builder_.CreateBitCast(
-          output_load, llvm::PointerType::get(get_fp_type(get_bit_width(ti), ctx), 0)));
-    } else if (ti.is_integer()) {
-      func_args.push_back(cgen_state->ir_builder_.CreateBitCast(
-          output_load, llvm::PointerType::get(get_int_type(get_bit_width(ti), ctx), 0)));
-    } else if (ti.is_column()) {
-      auto col = alloc_column(std::string("output_col.") + std::to_string(i),
-                              ti,
-                              output_load,
-                              output_row_count_ptr,
-                              ctx,
-                              cgen_state_->ir_builder_);
-      func_args.push_back(cgen_state->ir_builder_.CreateLoad(col));
-    } else {
-      throw std::runtime_error(
-          "Only integer and floating point columns are supported as outputs to table "
-          "functions.");
-    }
+    CHECK(!ti.is_column());  // UDTF output column type is its data type
+    auto col = alloc_column(std::string("output_col.") + std::to_string(i),
+                            ti,
+                            output_load,
+                            output_row_count_ptr,
+                            ctx,
+                            cgen_state_->ir_builder_,
+                            pass_column_by_value);
+    func_args.push_back(col);
   }
-
-  auto func_name = exe_unit.table_func_name;
+  auto func_name = exe_unit.table_func.getName();
   boost::algorithm::to_lower(func_name);
   const auto table_func_return =
       cgen_state->emitExternalCall(func_name, get_int_type(32, ctx), func_args);
@@ -323,11 +325,17 @@ void TableFunctionCompilationContext::generateGpuKernel() {
 
 void TableFunctionCompilationContext::finalize(const CompilationOptions& co,
                                                Executor* executor) {
-  if (rt_udf_cpu_module != nullptr) {
-    /*
-      TODO 1: eliminate need for OverrideFromSrc
-      TODO 2: detect and link only the udf's that are needed
-     */
+  /*
+    TODO 1: eliminate need for OverrideFromSrc
+    TODO 2: detect and link only the udf's that are needed
+  */
+  if (co.device_type == ExecutorDeviceType::GPU && rt_udf_gpu_module != nullptr) {
+    CodeGenerator::link_udf_module(rt_udf_gpu_module,
+                                   *module_,
+                                   cgen_state_.get(),
+                                   llvm::Linker::Flags::OverrideFromSrc);
+  }
+  if (co.device_type == ExecutorDeviceType::CPU && rt_udf_cpu_module != nullptr) {
     CodeGenerator::link_udf_module(rt_udf_cpu_module,
                                    *module_,
                                    cgen_state_.get(),

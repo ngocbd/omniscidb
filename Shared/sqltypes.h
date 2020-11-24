@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "Logger/Logger.h"
 #include "StringTransform.h"
 #include "funcannotations.h"
 
@@ -68,6 +69,77 @@ enum SQLTypes {
   kCOLUMN = 28,
   kSQLTYPE_LAST = 29
 };
+
+#ifndef __CUDACC__
+
+inline std::string toString(const SQLTypes& type) {
+  switch (type) {
+    case kNULLT:
+      return "NULL";
+    case kBOOLEAN:
+      return "BOOL";
+    case kCHAR:
+      return "CHAR";
+    case kVARCHAR:
+      return "VARCHAR";
+    case kNUMERIC:
+      return "NUMERIC";
+    case kDECIMAL:
+      return "DECIMAL";
+    case kINT:
+      return "INT";
+    case kSMALLINT:
+      return "SMALLINT";
+    case kFLOAT:
+      return "FLOAT";
+    case kDOUBLE:
+      return "DOUBLE";
+    case kTIME:
+      return "TIME";
+    case kTIMESTAMP:
+      return "TIMESTAMP";
+    case kBIGINT:
+      return "BIGINT";
+    case kTEXT:
+      return "TEXT";
+    case kDATE:
+      return "DATE";
+    case kARRAY:
+      return "ARRAY";
+    case kINTERVAL_DAY_TIME:
+      return "DAY TIME INTERVAL";
+    case kINTERVAL_YEAR_MONTH:
+      return "YEAR MONTH INTERVAL";
+    case kPOINT:
+      return "POINT";
+    case kLINESTRING:
+      return "LINESTRING";
+    case kPOLYGON:
+      return "POLYGON";
+    case kMULTIPOLYGON:
+      return "MULTIPOLYGON";
+    case kTINYINT:
+      return "TINYINT";
+    case kGEOMETRY:
+      return "GEOMETRY";
+    case kGEOGRAPHY:
+      return "GEOGRAPHY";
+    case kEVAL_CONTEXT_TYPE:
+      return "UNEVALUATED ANY";
+    case kVOID:
+      return "VOID";
+    case kCURSOR:
+      return "CURSOR";
+    case kCOLUMN:
+      return "COLUMN";
+    case kSQLTYPE_LAST:
+      break;
+  }
+  LOG(FATAL) << "Invalid SQL type: " << type;
+  return "";
+}
+
+#endif
 
 struct VarlenDatum {
   size_t length;
@@ -369,8 +441,7 @@ class SQLTypeInfo {
              type_name[static_cast<int>(type)] + srid_string + ")";
     }
     std::string ps = "";
-    if (type == kDECIMAL || type == kNUMERIC || subtype == kDECIMAL ||
-        subtype == kNUMERIC) {
+    if (type == kDECIMAL || type == kNUMERIC) {
       ps = "(" + std::to_string(dimension) + "," + std::to_string(scale) + ")";
     } else if (type == kTIMESTAMP) {
       ps = "(" + std::to_string(dimension) + ")";
@@ -379,13 +450,14 @@ class SQLTypeInfo {
       auto elem_ti = get_elem_type();
       auto num_elems = (size > 0) ? std::to_string(size / elem_ti.get_size()) : "";
       CHECK_LT(static_cast<int>(subtype), kSQLTYPE_LAST);
-      return type_name[static_cast<int>(subtype)] + ps + "[" + num_elems + "]";
+      return elem_ti.get_type_name() + ps + "[" + num_elems + "]";
     }
     if (type == kCOLUMN) {
       auto elem_ti = get_elem_type();
-      auto num_elems = (size > 0) ? std::to_string(size / elem_ti.get_size()) : "";
+      auto num_elems =
+          (size > 0) ? "[" + std::to_string(size / elem_ti.get_size()) + "]" : "";
       CHECK_LT(static_cast<int>(subtype), kSQLTYPE_LAST);
-      return "Column" + type_name[static_cast<int>(subtype)] + ps + "[" + num_elems + "]";
+      return "COLUMN<" + type_name[static_cast<int>(subtype)] + ps + ">" + num_elems;
     }
     return type_name[static_cast<int>(type)] + ps;
   }
@@ -427,6 +499,10 @@ class SQLTypeInfo {
   inline bool is_geometry() const { return IS_GEO(type); }
   inline bool is_column() const { return type == kCOLUMN; }
 
+  inline bool transforms() const {
+    return IS_GEO(type) && get_output_srid() != get_input_srid();
+  }
+
   inline bool is_varlen() const {  // TODO: logically this should ignore fixlen arrays
     return (IS_STRING(type) && compression != kENCODING_DICT) || type == kARRAY ||
            IS_GEO(type);
@@ -441,6 +517,11 @@ class SQLTypeInfo {
 
   inline bool is_dict_encoded_string() const {
     return is_string() && compression == kENCODING_DICT;
+  }
+
+  inline bool is_dict_encoded_type() const {
+    return is_dict_encoded_string() ||
+           (is_array() && get_elem_type().is_dict_encoded_string());
   }
 
   HOST DEVICE inline bool operator!=(const SQLTypeInfo& rhs) const {

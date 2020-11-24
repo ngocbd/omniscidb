@@ -22,6 +22,7 @@
 #include "Catalog/Catalog.h"
 #include "Catalog/ForeignTable.h"
 #include "DataMgr/Chunk/Chunk.h"
+#include "DataMgr/ForeignStorage/CsvReader.h"
 #include "ForeignDataWrapper.h"
 #include "ImportExport/Importer.h"
 
@@ -44,6 +45,17 @@ struct FileRegion {
   // Size of file region in bytes
   size_t region_size;
 
+  FileRegion(std::string name,
+             size_t first_row_offset,
+             size_t first_row_idx,
+             size_t row_cnt,
+             size_t region_sz)
+      : filename(name)
+      , first_row_file_offset(first_row_offset)
+      , first_row_index(first_row_idx)
+      , row_count(row_cnt)
+      , region_size(region_sz) {}
+  FileRegion() {}
   bool operator<(const FileRegion& other) const {
     return first_row_file_offset < other.first_row_file_offset;
   }
@@ -55,25 +67,35 @@ class CsvDataWrapper : public ForeignDataWrapper {
  public:
   CsvDataWrapper(const int db_id, const ForeignTable* foreign_table);
 
-  ForeignStorageBuffer* getChunkBuffer(const ChunkKey& chunk_key) override;
-  void populateMetadataForChunkKeyPrefix(
-      const ChunkKey& chunk_key_prefix,
-      ChunkMetadataVector& chunk_metadata_vector) override;
+  void populateChunkMetadata(ChunkMetadataVector& chunk_metadata_vector) override;
+
+  void populateChunkBuffers(
+      std::map<ChunkKey, AbstractBuffer*>& required_buffers,
+      std::map<ChunkKey, AbstractBuffer*>& optional_buffers) override;
+
   static void validateOptions(const ForeignTable* foreign_table);
+
+  static std::vector<std::string_view> getSupportedOptions();
+
+  void serializeDataWrapperInternals(const std::string& file_path) const override;
+
+  void restoreDataWrapperInternals(const std::string& file_path,
+                                   const ChunkMetadataVector& chunk_metadata) override;
+  bool isRestored() const override;
 
  private:
   CsvDataWrapper(const ForeignTable* foreign_table);
 
   /**
-   * Populates provided chunk with appropriate data by parsing all file regions
+   * Populates provided chunks with appropriate data by parsing all file regions
    * containing chunk data.
    *
-   * @param chunk_key - chunk key for chunk to be populated
-   * @param chunk - object containing data and (optional) index buffers to be populated
+   * @param column_id_to_chunk_map - map of column id to chunks to be populated
+   * @param fragment_id - fragment id of given chunks
    */
-  void populateChunk(ChunkKey chunk_key, Chunk_NS::Chunk& chunk);
+  void populateChunks(std::map<int, Chunk_NS::Chunk>& column_id_to_chunk_map,
+                      int fragment_id);
 
-  ForeignStorageBuffer* getBufferFromMap(const ChunkKey& chunk_key);
   std::string getFilePath();
   import_export::CopyParams validateAndGetCopyParams();
   void validateFilePath();
@@ -101,18 +123,31 @@ class CsvDataWrapper : public ForeignDataWrapper {
    */
   std::optional<bool> validateAndGetBoolValue(const std::string& option_name);
 
-  std::map<ChunkKey, std::unique_ptr<ForeignStorageBuffer>> chunk_buffer_map_;
+  void populateChunkMapForColumns(const std::set<const ColumnDescriptor*>& columns,
+                                  const int fragment_id,
+                                  const std::map<ChunkKey, AbstractBuffer*>& buffers,
+                                  std::map<int, Chunk_NS::Chunk>& column_id_to_chunk_map);
+
   std::map<ChunkKey, std::shared_ptr<ChunkMetadata>> chunk_metadata_map_;
   std::map<int, FileRegions> fragment_id_to_file_regions_map_;
+
+  std::unique_ptr<CsvReader> csv_reader_;
 
   const int db_id_;
   const ForeignTable* foreign_table_;
   std::mutex file_access_mutex_;
   std::mutex file_regions_mutex_;
 
-  static constexpr std::array<char const*, 13> supported_options_{"BASE_PATH",
-                                                                  "FILE_PATH",
-                                                                  "ARRAY_DELIMITER",
+  // Data needed for append workflow
+  std::map<ChunkKey, std::unique_ptr<ForeignStorageBuffer>> chunk_encoder_buffers_;
+  std::map<ChunkKey, size_t> chunk_byte_count_;
+  // How many rows have been read
+  size_t num_rows_;
+  // What byte offset we left off at in the csv_reader
+  size_t append_start_offset_;
+  // Is this datawrapper restored from disk
+  bool is_restored_;
+  static constexpr std::array<char const*, 11> supported_options_{"ARRAY_DELIMITER",
                                                                   "ARRAY_MARKER",
                                                                   "BUFFER_SIZE",
                                                                   "DELIMITER",

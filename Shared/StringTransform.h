@@ -17,8 +17,6 @@
 #ifndef SHARED_STRINGTRANSFORM_H
 #define SHARED_STRINGTRANSFORM_H
 
-#include "Logger.h"
-
 #ifndef __CUDACC__
 #include <boost/config.hpp>
 #include <boost/regex.hpp>
@@ -41,11 +39,7 @@ void apply_shim(std::string& result,
 template <typename... Ts>
 std::string cat(Ts&&... args) {
   std::ostringstream oss;
-#ifdef BOOST_NO_CXX17_FOLD_EXPRESSIONS
-  (void)(int[]){0, ((void)(oss << std::forward<Ts>(args)), 0)...};
-#else
   (oss << ... << std::forward<Ts>(args));
-#endif
   return oss.str();
 }
 #endif  // __CUDACC__
@@ -55,10 +49,12 @@ std::vector<std::pair<size_t, size_t>> find_string_literals(const std::string& q
 // Replace passwords, keys, etc. in a sql query with 'XXXXXXXX'.
 std::string hide_sensitive_data_from_query(std::string const& query_str);
 
-ssize_t inside_string_literal(
+#ifndef __CUDACC__
+std::optional<size_t> inside_string_literal(
     const size_t start,
     const size_t length,
     const std::vector<std::pair<size_t, size_t>>& literal_positions);
+#endif  // __CUDACC__
 
 template <typename T>
 std::string join(T const& container, std::string const& delim) {
@@ -119,19 +115,11 @@ std::string strip(std::string_view str);
 bool remove_unquoted_newlines_linefeeds_and_tabs_from_sql_string(
     std::string& str) noexcept;
 
-// Remove quotes if they match from beginning and end of string.
-// Return true if string was changed, false if not.
-// Does not check for escaped quotes within string.
-bool unquote(std::string&);
-
 #ifndef __CUDACC__
 //! Quote a string while escaping any existing quotes in the string.
 std::string get_quoted_string(const std::string& filename,
                               char quote = '"',
                               char escape = '\\');
-
-//! Throw exception if security problems found in a filename.
-void filename_security_check(const std::string& filename);
 #endif  // __CUDACC__
 
 #ifndef __CUDACC__

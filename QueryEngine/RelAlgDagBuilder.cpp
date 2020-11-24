@@ -15,7 +15,6 @@
  */
 
 #include "RelAlgDagBuilder.h"
-#include "../Shared/sqldefs.h"
 #include "CalciteDeserializerUtils.h"
 #include "Catalog/Catalog.h"
 #include "Descriptors/RelAlgExecutionDescriptor.h"
@@ -24,6 +23,7 @@
 #include "RelLeftDeepInnerJoin.h"
 #include "Rendering/RenderRelAlgUtils.h"
 #include "RexVisitor.h"
+#include "Shared/sqldefs.h"
 
 #include <rapidjson/error/en.h>
 #include <rapidjson/error/error.h>
@@ -196,7 +196,6 @@ RANodeOutput get_node_output(const RelAlgNode* ra_node) {
   const auto table_func_node = dynamic_cast<const RelTableFunction*>(ra_node);
   if (table_func_node) {
     // Table Function output count doesn't depend on the input
-    CHECK_EQ(size_t(1), table_func_node->inputCount());
     return n_outputs(table_func_node, table_func_node->size());
   }
   const auto sort_node = dynamic_cast<const RelSort*>(ra_node);
@@ -595,7 +594,7 @@ size_t RelLogicalUnion::size() const {
 }
 
 std::string RelLogicalUnion::toString() const {
-  return cat("(RelLogicalUnion<", this, ">(is_all(", is_all_, ")))");
+  return cat(::typeName(this), "(is_all(", is_all_, "))");
 }
 
 std::string RelLogicalUnion::getFieldName(const size_t i) const {
@@ -1143,7 +1142,6 @@ void bind_project_to_input(RelProject* project_node, const RANodeOutput& input) 
 
 void bind_table_func_to_input(RelTableFunction* table_func_node,
                               const RANodeOutput& input) noexcept {
-  CHECK_EQ(size_t(1), table_func_node->inputCount());
   std::vector<std::unique_ptr<const RexScalar>> disambiguated_exprs;
   for (size_t i = 0; i < table_func_node->getTableFuncInputsSize(); ++i) {
     const auto target_expr = table_func_node->getTableFuncInputAt(i);
@@ -1182,8 +1180,17 @@ void bind_inputs(const std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept
     }
     const auto table_func_node = std::dynamic_pointer_cast<RelTableFunction>(ra_node);
     if (table_func_node) {
-      bind_table_func_to_input(table_func_node.get(),
-                               get_node_output(table_func_node->getInput(0)));
+      /*
+        Collect all inputs from table function input (non-literal)
+        arguments.
+      */
+      RANodeOutput input;
+      input.reserve(table_func_node->inputCount());
+      for (size_t i = 0; i < table_func_node->inputCount(); i++) {
+        auto node_output = get_node_output(table_func_node->getInput(i));
+        input.insert(input.end(), node_output.begin(), node_output.end());
+      }
+      bind_table_func_to_input(table_func_node.get(), input);
     }
   }
 }
@@ -2314,8 +2321,6 @@ class RelAlgDispatcher {
       const rapidjson::Value& table_func_ra,
       RelAlgDagBuilder& root_dag_builder) {
     const auto inputs = getRelAlgInputs(table_func_ra);
-    CHECK_EQ(size_t(1), inputs.size());
-
     const auto& invocation = field(table_func_ra, "invocation");
     CHECK(invocation.IsObject());
 
@@ -2331,7 +2336,6 @@ class RelAlgDispatcher {
          ++exprs_json_it) {
       const auto& expr_json = *exprs_json_it;
       CHECK(expr_json.IsObject());
-
       if (expr_json.HasMember("op")) {
         const auto op_str = json_str(field(expr_json, "op"));
         if (op_str == "CAST" && expr_json.HasMember("type")) {
@@ -2348,17 +2352,12 @@ class RelAlgDispatcher {
                   "Table functions currently only support one ResultSet input");
             }
 
-            CHECK(expr_json.HasMember("type"));
-            const auto& expr_types = field(invocation, "type");
-            CHECK(expr_types.IsArray());
-
             const auto prior_node = prev(table_func_ra);
             CHECK(prior_node);
-            CHECK_EQ(prior_node->size(), expr_types.Size());
-
             // Forward the values from the prior node as RexInputs
             for (size_t i = 0; i < prior_node->size(); i++) {
-              table_func_inputs.emplace_back(std::make_unique<RexAbstractInput>(i));
+              table_func_inputs.emplace_back(
+                  std::make_unique<RexAbstractInput>(col_inputs.size()));
               col_inputs.emplace_back(table_func_inputs.back().get());
             }
             continue;
@@ -2377,7 +2376,6 @@ class RelAlgDispatcher {
     CHECK(row_types.IsArray());
     CHECK_GE(row_types.Size(), unsigned(0));
     const auto& row_types_array = row_types.GetArray();
-
     for (size_t i = 0; i < row_types_array.Size(); i++) {
       // We don't care about the type information in rowType -- replace each output with
       // a reference to be resolved later in the translator
@@ -2386,7 +2384,7 @@ class RelAlgDispatcher {
     }
 
     return std::make_shared<RelTableFunction>(op_name.GetString(),
-                                              inputs[0],
+                                              inputs,
                                               fields,
                                               col_inputs,
                                               table_func_inputs,
@@ -2651,7 +2649,7 @@ void RelAlgDagBuilder::build(const rapidjson::Value& query_ast,
     add_window_function_pre_project(nodes_);
   }
   coalesce_nodes(nodes_, left_deep_joins);
-  CHECK(nodes_.back().unique());
+  CHECK(nodes_.back().use_count() == 1);
   create_left_deep_join(nodes_);
 }
 
@@ -2679,4 +2677,36 @@ std::string tree_string(const RelAlgNode* ra, const size_t depth) {
     result += tree_string(ra->getInput(i), depth + 1);
   }
   return result;
+}
+
+std::string RexSubQuery::toString() const {
+  return cat(::typeName(this), "(", ::toString(ra_.get()), ")");
+}
+
+std::string RexInput::toString() const {
+  return cat(::typeName(this),
+             "(node=",
+             ::toString(node_),
+             ", in_index=",
+             std::to_string(getIndex()),
+             ")");
+}
+
+std::string RelCompound::toString() const {
+  return cat(::typeName(this),
+             "(",
+             (filter_expr_ ? filter_expr_->toString() : "null"),
+             ", target_exprs=",
+             ::toString(target_exprs_),
+             ", ",
+             std::to_string(groupby_count_),
+             ", agg_exps=",
+             ::toString(agg_exprs_),
+             ", fields=",
+             ::toString(fields_),
+             ", scalar_sources=",
+             ::toString(scalar_sources_),
+             ", is_agg=",
+             std::to_string(is_agg_),
+             ")");
 }

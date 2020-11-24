@@ -22,6 +22,7 @@
 #include "LLVMGlobalContext.h"
 
 #include "../Analyzer/Analyzer.h"
+#include "../Shared/InsertionOrderedMap.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
@@ -29,15 +30,30 @@
 
 struct CgenState {
  public:
-  CgenState(const std::vector<InputTableInfo>& query_infos,
-            const bool contains_left_deep_outer_join)
+  CgenState(const size_t num_query_infos, const bool contains_left_deep_outer_join)
       : module_(nullptr)
       , row_func_(nullptr)
+      , filter_func_(nullptr)
+      , current_func_(nullptr)
+      , row_func_bb_(nullptr)
+      , filter_func_bb_(nullptr)
+      , row_func_call_(nullptr)
+      , filter_func_call_(nullptr)
       , context_(getGlobalLLVMContext())
       , ir_builder_(context_)
       , contains_left_deep_outer_join_(contains_left_deep_outer_join)
-      , outer_join_match_found_per_level_(std::max(query_infos.size(), size_t(1)) - 1)
-      , query_infos_(query_infos)
+      , outer_join_match_found_per_level_(std::max(num_query_infos, size_t(1)) - 1)
+      , needs_error_check_(false)
+      , needs_geos_(false)
+      , query_func_(nullptr)
+      , query_func_entry_ir_builder_(context_){};
+
+  CgenState(llvm::LLVMContext& context)
+      : module_(nullptr)
+      , row_func_(nullptr)
+      , context_(context)
+      , ir_builder_(context_)
+      , contains_left_deep_outer_join_(false)
       , needs_error_check_(false)
       , needs_geos_(false)
       , query_func_(nullptr)
@@ -228,11 +244,7 @@ struct CgenState {
 
     auto func_p = module_->getOrInsertFunction(fname, func_ty, attrs);
     CHECK(func_p);
-#if LLVM_VERSION_MAJOR > 8
     auto callee = func_p.getCallee();
-#else
-    auto callee = func_p;
-#endif
     llvm::Function* func{nullptr};
     if (auto callee_cast = llvm::dyn_cast<llvm::ConstantExpr>(callee)) {
       // Get or insert function automatically adds a ConstantExpr cast if the return type
@@ -244,11 +256,7 @@ struct CgenState {
       func = llvm::dyn_cast<llvm::Function>(callee);
     }
     CHECK(func);
-#if LLVM_VERSION_MAJOR > 8
     llvm::FunctionType* func_type = func_p.getFunctionType();
-#else
-    llvm::FunctionType* func_type = func->getFunctionType();
-#endif
     CHECK(func_type);
     if (has_struct_return) {
       const auto arg_ti = func_type->getParamType(0);
@@ -264,11 +272,7 @@ struct CgenState {
       if (arg_ti->isPointerTy() && arg_ti->getPointerElementType()->isStructTy()) {
         auto attr_list = func->getAttributes();
         llvm::AttrBuilder arr_arg_builder(attr_list.getParamAttributes(i));
-#if LLVM_VERSION_MAJOR > 8
         arr_arg_builder.addByValAttr(arg_ti->getPointerElementType());
-#else
-        arr_arg_builder.addAttribute(llvm::Attribute::ByVal);
-#endif
         func->addParamAttrs(i, arr_arg_builder);
       }
     }
@@ -313,6 +317,12 @@ struct CgenState {
 
   llvm::Module* module_;
   llvm::Function* row_func_;
+  llvm::Function* filter_func_;
+  llvm::Function* current_func_;
+  llvm::BasicBlock* row_func_bb_;
+  llvm::BasicBlock* filter_func_bb_;
+  llvm::CallInst* row_func_call_;
+  llvm::CallInst* filter_func_call_;
   std::vector<llvm::Function*> helper_functions_;
   llvm::LLVMContext& context_;
   llvm::ValueToValueMapTy vmap_;  // used for cloning the runtime module
@@ -329,8 +339,8 @@ struct CgenState {
   const bool contains_left_deep_outer_join_;
   std::vector<llvm::Value*> outer_join_match_found_per_level_;
   std::unordered_map<int, llvm::Value*> scan_idx_to_hash_pos_;
+  InsertionOrderedMap filter_func_args_;
   std::vector<std::unique_ptr<const InValuesBitmap>> in_values_bitmaps_;
-  const std::vector<InputTableInfo>& query_infos_;
   bool needs_error_check_;
   bool needs_geos_;
 
@@ -405,3 +415,5 @@ struct CgenState {
   std::unordered_map<int, LiteralValues> literals_;
   std::unordered_map<int, size_t> literal_bytes_;
 };
+
+#include "AutomaticIRMetadataGuard.h"

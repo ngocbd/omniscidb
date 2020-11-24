@@ -17,7 +17,6 @@
 #include "Execute.h"
 
 #include "AggregateUtils.h"
-#include "BaselineJoinHashTable.h"
 #include "CodeGenerator.h"
 #include "ColumnFetcher.h"
 #include "Descriptors/QueryCompilationDescriptor.h"
@@ -29,9 +28,10 @@
 #include "ExternalCacheInvalidators.h"
 #include "GpuMemUtils.h"
 #include "InPlaceSort.h"
+#include "JoinHashTable/BaselineJoinHashTable.h"
+#include "JoinHashTable/OverlapsJoinHashTable.h"
 #include "JsonAccessors.h"
 #include "OutputBufferInitialization.h"
-#include "OverlapsJoinHashTable.h"
 #include "QueryEngine/QueryDispatchQueue.h"
 #include "QueryRewrite.h"
 #include "QueryTemplateGenerator.h"
@@ -52,7 +52,6 @@
 #include "Shared/misc.h"
 #include "Shared/scope.h"
 #include "Shared/shard_key.h"
-#include "Shared/sql_type_to_string.h"
 #include "Shared/threadpool.h"
 
 #include "AggregatedColRange.h"
@@ -74,6 +73,7 @@
 bool g_enable_watchdog{false};
 bool g_enable_dynamic_watchdog{false};
 bool g_use_tbb_pool{false};
+bool g_enable_filter_function{true};
 unsigned g_dynamic_watchdog_time_limit{10000};
 bool g_allow_cpu_retry{true};
 bool g_null_div_by_zero{false};
@@ -90,7 +90,6 @@ size_t g_filter_push_down_passing_row_ubound{0};
 bool g_enable_columnar_output{false};
 bool g_enable_overlaps_hashjoin{false};
 bool g_enable_hashjoin_many_to_many{false};
-bool g_cache_string_hash{true};
 size_t g_overlaps_max_table_size_bytes{1024 * 1024 * 1024};
 bool g_strip_join_covered_quals{false};
 size_t g_constrained_by_in_threshold{10};
@@ -107,7 +106,8 @@ bool g_enable_direct_columnarization{true};
 extern bool g_enable_experimental_string_functions;
 bool g_enable_runtime_query_interrupt{false};
 bool g_use_estimator_result_cache{true};
-unsigned g_runtime_query_interrupt_frequency{1000};
+unsigned g_pending_query_interrupt_freq{1000};
+double g_running_query_interrupt_freq{0.5};
 size_t g_gpu_smem_threshold{
     4096};  // GPU shared memory threshold (in bytes), if larger
             // buffer sizes are required we do not use GPU shared
@@ -121,6 +121,8 @@ bool g_enable_smem_non_grouped_agg{
             // non-grouped aggregates
 bool g_is_test_env{false};  // operating under a unit test environment. Currently only
                             // limits the allocation for the output buffer arena
+
+extern bool g_cache_string_hash;
 
 int const Executor::max_gpu_count;
 
@@ -208,9 +210,8 @@ StringDictionaryProxy* Executor::getStringDictionaryProxy(
     CHECK(dd->stringDict);
     CHECK_LE(dd->dictNBits, 32);
     CHECK(row_set_mem_owner);
-    const auto generation = with_generation
-                                ? string_dictionary_generations_.getGeneration(dict_id)
-                                : ssize_t(-1);
+    const int64_t generation =
+        with_generation ? string_dictionary_generations_.getGeneration(dict_id) : -1;
     return row_set_mem_owner->addStringDict(dd->stringDict, dict_id, generation);
   }
   CHECK_EQ(0, dict_id);
@@ -1122,15 +1123,15 @@ bool is_trivial_loop_join(const std::vector<InputTableInfo>& query_infos,
   // where ra_exe_unit.input_descs.size() > 2 for now.
   const auto inner_table_id = ra_exe_unit.input_descs.back().getTableId();
 
-  ssize_t inner_table_idx = -1;
+  std::optional<size_t> inner_table_idx;
   for (size_t i = 0; i < query_infos.size(); ++i) {
     if (query_infos[i].table_id == inner_table_id) {
       inner_table_idx = i;
       break;
     }
   }
-  CHECK_NE(ssize_t(-1), inner_table_idx);
-  return query_infos[inner_table_idx].info.getNumTuples() <=
+  CHECK(inner_table_idx);
+  return query_infos[*inner_table_idx].info.getNumTuples() <=
          g_trivial_loop_join_threshold;
 }
 
@@ -1233,7 +1234,7 @@ std::string ra_exec_unit_desc_for_caching(const RelAlgExecutionUnit& ra_exe_unit
       os << expr->toString() << ",";
     }
   }
-  os << bool_to_string(ra_exe_unit.estimator == nullptr);
+  os << ::toString(ra_exe_unit.estimator == nullptr);
   os << std::to_string(ra_exe_unit.scan_limit);
   return os.str();
 }
@@ -1270,7 +1271,7 @@ std::ostream& operator<<(std::ostream& os, const RelAlgExecutionUnit& ra_exe_uni
   }
   os << "\n\tProjected targets: "
      << boost::algorithm::join(expr_container_to_string(ra_exe_unit.target_exprs), ", ");
-  os << "\n\tHas Estimator: " << bool_to_string(ra_exe_unit.estimator == nullptr);
+  os << "\n\tHas Estimator: " << ::toString(ra_exe_unit.estimator == nullptr);
   os << "\n\tSort Info: ";
   const auto& sort_info = ra_exe_unit.sort_info;
   os << "\n\t  Order Entries: "
@@ -1279,7 +1280,7 @@ std::ostream& operator<<(std::ostream& os, const RelAlgExecutionUnit& ra_exe_uni
   os << "\n\t  Limit: " << std::to_string(sort_info.limit);
   os << "\n\t  Offset: " << std::to_string(sort_info.offset);
   os << "\n\tScan Limit: " << std::to_string(ra_exe_unit.scan_limit);
-  os << "\n\tBump Allocator: " << bool_to_string(ra_exe_unit.use_bump_allocator);
+  os << "\n\tBump Allocator: " << ::toString(ra_exe_unit.use_bump_allocator);
   if (ra_exe_unit.union_all) {
     os << "\n\tUnion: " << std::string(*ra_exe_unit.union_all ? "UNION ALL" : "UNION");
   }
@@ -1307,18 +1308,16 @@ RelAlgExecutionUnit replace_scan_limit(const RelAlgExecutionUnit& ra_exe_unit_in
 
 }  // namespace
 
-ResultSetPtr Executor::executeWorkUnit(
-    size_t& max_groups_buffer_entry_guess,
-    const bool is_agg,
-    const std::vector<InputTableInfo>& query_infos,
-    const RelAlgExecutionUnit& ra_exe_unit_in,
-    const CompilationOptions& co,
-    const ExecutionOptions& eo,
-    const Catalog_Namespace::Catalog& cat,
-    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
-    RenderInfo* render_info,
-    const bool has_cardinality_estimation,
-    ColumnCacheMap& column_cache) {
+ResultSetPtr Executor::executeWorkUnit(size_t& max_groups_buffer_entry_guess,
+                                       const bool is_agg,
+                                       const std::vector<InputTableInfo>& query_infos,
+                                       const RelAlgExecutionUnit& ra_exe_unit_in,
+                                       const CompilationOptions& co,
+                                       const ExecutionOptions& eo,
+                                       const Catalog_Namespace::Catalog& cat,
+                                       RenderInfo* render_info,
+                                       const bool has_cardinality_estimation,
+                                       ColumnCacheMap& column_cache) {
   VLOG(1) << "Executor " << executor_id_ << " is executing work unit:" << ra_exe_unit_in;
 
   ScopeGuard cleanup_post_execution = [this] {
@@ -1339,7 +1338,7 @@ ResultSetPtr Executor::executeWorkUnit(
                                       co,
                                       eo,
                                       cat,
-                                      row_set_mem_owner,
+                                      row_set_mem_owner_,
                                       render_info,
                                       has_cardinality_estimation,
                                       column_cache);
@@ -1358,7 +1357,7 @@ ResultSetPtr Executor::executeWorkUnit(
                             co,
                             eo,
                             cat,
-                            row_set_mem_owner,
+                            row_set_mem_owner_,
                             render_info,
                             has_cardinality_estimation,
                             column_cache);
@@ -1384,7 +1383,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     const bool has_cardinality_estimation,
     ColumnCacheMap& column_cache) {
   INJECT_TIMER(Exec_executeWorkUnit);
-  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in, co);
+  const auto [ra_exe_unit, deleted_cols_map] = addDeletedColumn(ra_exe_unit_in, co);
   const auto device_type = getDeviceTypeForTargets(ra_exe_unit, co.device_type);
   CHECK(!query_infos.empty());
   if (!max_groups_buffer_entry_guess) {
@@ -1414,6 +1413,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
                                            has_cardinality_estimation,
                                            ra_exe_unit,
                                            query_infos,
+                                           deleted_cols_map,
                                            column_fetcher,
                                            {device_type,
                                             co.hoist_literals,
@@ -1433,7 +1433,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
         continue;
       }
     } else {
-      plan_state_.reset(new PlanState(false, this));
+      plan_state_.reset(new PlanState(false, query_infos, deleted_cols_map, this));
       plan_state_->allocateLocalColumnIds(ra_exe_unit.input_col_descs);
       CHECK(!query_mem_desc_owned);
       query_mem_desc_owned.reset(
@@ -1530,7 +1530,7 @@ void Executor::executeWorkUnitPerFragment(const RelAlgExecutionUnit& ra_exe_unit
                                           const ExecutionOptions& eo,
                                           const Catalog_Namespace::Catalog& cat,
                                           PerFragmentCallBack& cb) {
-  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in, co);
+  const auto [ra_exe_unit, deleted_cols_map] = addDeletedColumn(ra_exe_unit_in, co);
   ColumnCacheMap column_cache;
 
   std::vector<InputTableInfo> table_infos{table_info};
@@ -1549,6 +1549,7 @@ void Executor::executeWorkUnitPerFragment(const RelAlgExecutionUnit& ra_exe_unit
                                        /*has_cardinality_estimation=*/false,
                                        ra_exe_unit,
                                        table_infos,
+                                       deleted_cols_map,
                                        column_fetcher,
                                        co,
                                        eo,
@@ -1580,8 +1581,7 @@ void Executor::executeWorkUnitPerFragment(const RelAlgExecutionUnit& ra_exe_unit
                              fragments_list,
                              ExecutorDispatchMode::KernelPerFragment,
                              /*render_info=*/nullptr,
-                             /*rowid_lookup_key=*/-1,
-                             logger::thread_id());
+                             /*rowid_lookup_key=*/-1);
       kernel.run(this, kernel_context);
     }
   }
@@ -1602,7 +1602,7 @@ ResultSetPtr Executor::executeTableFunction(
     const ExecutionOptions& eo,
     const Catalog_Namespace::Catalog& cat) {
   INJECT_TIMER(Exec_executeTableFunction);
-  nukeOldState(false, table_infos, nullptr);
+  nukeOldState(false, table_infos, PlanState::DeletedColumnsMap{}, nullptr);
 
   ColumnCacheMap column_cache;  // Note: if we add retries to the table function
                                 // framework, we may want to move this up a level
@@ -1612,13 +1612,8 @@ ResultSetPtr Executor::executeTableFunction(
   compilation_context.compile(exe_unit, co, this);
 
   TableFunctionExecutionContext exe_context(getRowSetMemoryOwner());
-  CHECK_EQ(table_infos.size(), size_t(1));
-  return exe_context.execute(exe_unit,
-                             table_infos.front(),
-                             &compilation_context,
-                             column_fetcher,
-                             co.device_type,
-                             this);
+  return exe_context.execute(
+      exe_unit, table_infos, &compilation_context, column_fetcher, co.device_type, this);
 }
 
 ResultSetPtr Executor::executeExplain(const QueryCompilationDescriptor& query_comp_desc) {
@@ -2002,11 +1997,9 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
                                       &eo,
                                       &query_comp_desc,
                                       &query_mem_desc,
-                                      render_info,
-                                      parent_thread_id = logger::thread_id()](
-                                         const int device_id,
-                                         const FragmentsList& frag_list,
-                                         const int64_t rowid_lookup_key) {
+                                      render_info](const int device_id,
+                                                   const FragmentsList& frag_list,
+                                                   const int64_t rowid_lookup_key) {
       execution_kernels.emplace_back(
           std::make_unique<ExecutionKernel>(ra_exe_unit,
                                             ExecutorDeviceType::GPU,
@@ -2018,8 +2011,7 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
                                             frag_list,
                                             ExecutorDispatchMode::MultifragmentKernel,
                                             render_info,
-                                            rowid_lookup_key,
-                                            parent_thread_id));
+                                            rowid_lookup_key));
     };
     fragment_descriptor.assignFragsToMultiDispatch(multifrag_kernel_dispatch);
   } else {
@@ -2048,11 +2040,9 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
                                          &device_type,
                                          &query_comp_desc,
                                          &query_mem_desc,
-                                         render_info,
-                                         parent_thread_id = logger::thread_id()](
-                                            const int device_id,
-                                            const FragmentsList& frag_list,
-                                            const int64_t rowid_lookup_key) {
+                                         render_info](const int device_id,
+                                                      const FragmentsList& frag_list,
+                                                      const int64_t rowid_lookup_key) {
       if (!frag_list.size()) {
         return;
       }
@@ -2069,8 +2059,7 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
                                             frag_list,
                                             ExecutorDispatchMode::KernelPerFragment,
                                             render_info,
-                                            rowid_lookup_key,
-                                            parent_thread_id));
+                                            rowid_lookup_key));
       ++frag_list_idx;
     };
 
@@ -2091,9 +2080,11 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
   THREAD_POOL thread_pool;
   VLOG(1) << "Launching " << kernels.size() << " kernels for query.";
   for (auto& kernel : kernels) {
-    thread_pool.append(
-        [this, &shared_context](ExecutionKernel* kernel) {
+    thread_pool.spawn(
+        [this, &shared_context, parent_thread_id = logger::thread_id()](
+            ExecutionKernel* kernel) {
           CHECK(kernel);
+          DEBUG_TIMER_NEW_THREAD(parent_thread_id);
           kernel->run(this, shared_context);
         },
         kernel.get());
@@ -3037,6 +3028,7 @@ std::vector<int64_t> Executor::getJoinHashTablePtrs(const ExecutorDeviceType dev
 
 void Executor::nukeOldState(const bool allow_lazy_fetch,
                             const std::vector<InputTableInfo>& query_infos,
+                            const PlanState::DeletedColumnsMap& deleted_cols_map,
                             const RelAlgExecutionUnit* ra_exe_unit) {
   kernel_queue_time_ms_ = 0;
   compilation_queue_time_ms_ = 0;
@@ -3046,13 +3038,16 @@ void Executor::nukeOldState(const bool allow_lazy_fetch,
                                   [](const JoinCondition& join_condition) {
                                     return join_condition.type == JoinType::LEFT;
                                   }) != ra_exe_unit->join_quals.end();
-  cgen_state_.reset(new CgenState(query_infos, contains_left_deep_outer_join));
-  plan_state_.reset(
-      new PlanState(allow_lazy_fetch && !contains_left_deep_outer_join, this));
+  cgen_state_.reset(new CgenState(query_infos.size(), contains_left_deep_outer_join));
+  plan_state_.reset(new PlanState(allow_lazy_fetch && !contains_left_deep_outer_join,
+                                  query_infos,
+                                  deleted_cols_map,
+                                  this));
 }
 
 void Executor::preloadFragOffsets(const std::vector<InputDescriptor>& input_descs,
                                   const std::vector<InputTableInfo>& query_infos) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto ld_count = input_descs.size();
   auto frag_off_ptr = get_arg_by_name(cgen_state_->row_func_, "frag_row_off");
   for (size_t i = 0; i < ld_count; ++i) {
@@ -3146,6 +3141,7 @@ int64_t Executor::deviceCycles(int milliseconds) const {
 }
 
 llvm::Value* Executor::castToFP(llvm::Value* val) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   if (!val->getType()->isIntegerTy()) {
     return val;
   }
@@ -3166,6 +3162,7 @@ llvm::Value* Executor::castToFP(llvm::Value* val) {
 }
 
 llvm::Value* Executor::castToIntPtrTyIn(llvm::Value* val, const size_t bitWidth) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   CHECK(val->getType()->isPointerTy());
 
   const auto val_ptr_type = static_cast<llvm::PointerType*>(val->getType());
@@ -3195,12 +3192,14 @@ llvm::Value* Executor::castToIntPtrTyIn(llvm::Value* val, const size_t bitWidth)
 #include "StringFunctions.cpp"
 #undef EXECUTE_INCLUDE
 
-RelAlgExecutionUnit Executor::addDeletedColumn(const RelAlgExecutionUnit& ra_exe_unit,
-                                               const CompilationOptions& co) {
+std::tuple<RelAlgExecutionUnit, PlanState::DeletedColumnsMap> Executor::addDeletedColumn(
+    const RelAlgExecutionUnit& ra_exe_unit,
+    const CompilationOptions& co) {
   if (!co.filter_on_deleted_column) {
-    return ra_exe_unit;
+    return std::make_tuple(ra_exe_unit, PlanState::DeletedColumnsMap{});
   }
   auto ra_exe_unit_with_deleted = ra_exe_unit;
+  PlanState::DeletedColumnsMap deleted_cols_map;
   for (const auto& input_table : ra_exe_unit_with_deleted.input_descs) {
     if (input_table.getSourceType() != InputSourceType::TABLE) {
       continue;
@@ -3225,9 +3224,16 @@ RelAlgExecutionUnit Executor::addDeletedColumn(const RelAlgExecutionUnit& ra_exe
       // add deleted column
       ra_exe_unit_with_deleted.input_col_descs.emplace_back(new InputColDescriptor(
           deleted_cd->columnId, deleted_cd->tableId, input_table.getNestLevel()));
+      auto deleted_cols_it = deleted_cols_map.find(deleted_cd->tableId);
+      if (deleted_cols_it == deleted_cols_map.end()) {
+        CHECK(deleted_cols_map.insert(std::make_pair(deleted_cd->tableId, deleted_cd))
+                  .second);
+      } else {
+        CHECK_EQ(deleted_cd, deleted_cols_it->second);
+      }
     }
   }
-  return ra_exe_unit_with_deleted;
+  return std::make_tuple(ra_exe_unit_with_deleted, deleted_cols_map);
 }
 
 namespace {
@@ -3248,15 +3254,23 @@ std::tuple<bool, int64_t, int64_t> get_hpt_overflow_underflow_safe_scaled_values
     return {true, chunk_min / scale, chunk_max / scale};
   }
 
-  int64_t upscaled_chunk_min;
-  int64_t upscaled_chunk_max;
+  using checked_int64_t = boost::multiprecision::number<
+      boost::multiprecision::cpp_int_backend<64,
+                                             64,
+                                             boost::multiprecision::signed_magnitude,
+                                             boost::multiprecision::checked,
+                                             void>>;
 
-  if (__builtin_mul_overflow(chunk_min, scale, &upscaled_chunk_min) ||
-      __builtin_mul_overflow(chunk_max, scale, &upscaled_chunk_max)) {
-    return std::make_tuple(false, chunk_min, chunk_max);
+  try {
+    auto ret =
+        std::make_tuple(true,
+                        int64_t(checked_int64_t(chunk_min) * checked_int64_t(scale)),
+                        int64_t(checked_int64_t(chunk_max) * checked_int64_t(scale)));
+    return ret;
+  } catch (const std::overflow_error& e) {
+    // noop
   }
-
-  return std::make_tuple(true, upscaled_chunk_min, upscaled_chunk_max);
+  return std::make_tuple(false, chunk_min, chunk_max);
 }
 
 }  // namespace
@@ -3321,6 +3335,10 @@ std::pair<bool, int64_t> Executor::skipFragment(
       chunk_min = extract_min_stat(chunk_meta_it->second->chunkStats, chunk_type);
       chunk_max = extract_max_stat(chunk_meta_it->second->chunkStats, chunk_type);
     }
+    if (chunk_min > chunk_max) {
+      // invalid metadata range, do not skip fragment
+      return {false, -1};
+    }
     if (lhs->get_type_info().is_timestamp() &&
         (lhs_col->get_type_info().get_dimension() !=
          rhs_const->get_type_info().get_dimension()) &&
@@ -3349,8 +3367,12 @@ std::pair<bool, int64_t> Executor::skipFragment(
         return {false, -1};
       }
     }
-    CodeGenerator code_generator(this);
-    const auto rhs_val = code_generator.codegenIntConst(rhs_const)->getSExtValue();
+    llvm::LLVMContext local_context;
+    CgenState local_cgen_state(local_context);
+    CodeGenerator code_generator(&local_cgen_state, nullptr);
+
+    const auto rhs_val =
+        CodeGenerator::codegenIntConst(rhs_const, &local_cgen_state)->getSExtValue();
 
     switch (comp_expr->get_optype()) {
       case kGE:
@@ -3497,7 +3519,8 @@ TableGenerations Executor::computeTableGenerations(
   for (const int table_id : phys_table_ids) {
     const auto table_info = getTableInfo(table_id);
     table_generations.setGeneration(
-        table_id, TableGeneration{table_info.getPhysicalNumTuples(), 0});
+        table_id,
+        TableGeneration{static_cast<int64_t>(table_info.getPhysicalNumTuples()), 0});
   }
   return table_generations;
 }
@@ -3521,6 +3544,9 @@ void Executor::setCurrentQuerySession(const std::string& query_session,
   if (current_query_session_ == "") {
     // only set the query session if it currently has an invalid session
     current_query_session_ = query_session;
+    if (queries_session_map_.count(query_session)) {
+      queries_session_map_.at(query_session).setQueryStatusAsRunning();
+    }
   }
 }
 
@@ -3539,13 +3565,18 @@ bool Executor::checkCurrentQuerySession(const std::string& candidate_query_sessi
 }
 
 template <>
-void Executor::invalidateQuerySession(mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+void Executor::invalidateRunningQuerySession(
+    mapd_unique_lock<mapd_shared_mutex>& write_lock) {
   current_query_session_ = "";
 }
 
 template <>
 bool Executor::addToQuerySessionList(const std::string& query_session,
+                                     const std::string& query_str,
                                      mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  queries_session_map_.emplace(
+      query_session,
+      QuerySessionStatus(query_session, query_str, std::chrono::system_clock::now()));
   return queries_interrupt_flag_.emplace(query_session, false).second;
 }
 
@@ -3553,6 +3584,7 @@ template <>
 bool Executor::removeFromQuerySessionList(
     const std::string& query_session,
     mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  queries_session_map_.erase(query_session);
   return queries_interrupt_flag_.erase(query_session);
 }
 
@@ -3560,7 +3592,9 @@ template <>
 void Executor::setQuerySessionAsInterrupted(
     const std::string& query_session,
     mapd_unique_lock<mapd_shared_mutex>& write_lock) {
-  queries_interrupt_flag_[query_session] = true;
+  if (queries_interrupt_flag_.find(query_session) != queries_interrupt_flag_.end()) {
+    queries_interrupt_flag_[query_session] = true;
+  }
 }
 
 template <>
@@ -3571,13 +3605,19 @@ bool Executor::checkIsQuerySessionInterrupted(
   return flag_it != queries_interrupt_flag_.end() && flag_it->second;
 }
 
-void Executor::enableRuntimeQueryInterrupt(const unsigned interrupt_freq) const {
+void Executor::enableRuntimeQueryInterrupt(
+    const double runtime_query_check_freq,
+    const unsigned pending_query_check_freq) const {
   // The only one scenario that we intentionally call this function is
   // to allow runtime query interrupt in QueryRunner for test cases.
   // Because test machine's default setting does not allow runtime query interrupt,
   // so we have to turn it on within test code if necessary.
   g_enable_runtime_query_interrupt = true;
-  g_runtime_query_interrupt_frequency = interrupt_freq;
+  g_pending_query_interrupt_freq = pending_query_check_freq;
+  g_running_query_interrupt_freq = runtime_query_check_freq;
+  if (g_running_query_interrupt_freq) {
+    g_running_query_interrupt_freq = 0.5;
+  }
 }
 
 void Executor::addToCardinalityCache(const std::string& cache_key,
@@ -3599,11 +3639,27 @@ Executor::CachedCardinality Executor::getCachedCardinality(const std::string& ca
   return {false, -1};
 }
 
+std::optional<QuerySessionStatus> Executor::getQuerySessionInfo(
+    const std::string& query_session,
+    mapd_shared_lock<mapd_shared_mutex>& read_lock) {
+  if (!queries_session_map_.empty() && queries_session_map_.count(query_session)) {
+    auto& query_info = queries_session_map_.at(query_session);
+    const std::string query_status =
+        getCurrentQuerySession(read_lock) == query_session ? "Running" : "Pending";
+    return QuerySessionStatus(query_session,
+                              query_info.getQueryStr(),
+                              query_info.getQuerySubmittedTime(),
+                              query_status);
+  }
+  return std::nullopt;
+}
+
 std::map<int, std::shared_ptr<Executor>> Executor::executors_;
 
 std::atomic_flag Executor::execute_spin_lock_ = ATOMIC_FLAG_INIT;
 std::string Executor::current_query_session_{""};
 InterruptFlagMap Executor::queries_interrupt_flag_;
+QuerySessionMap Executor::queries_session_map_;
 mapd_shared_mutex Executor::executor_session_mutex_;
 
 mapd_shared_mutex Executor::execute_mutex_;

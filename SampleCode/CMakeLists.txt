@@ -2,7 +2,11 @@ cmake_minimum_required(VERSION 2.8)
 set(RUNTIME_OUTPUT_PATH ${CMAKE_CURRENT_BINARY_DIR})
 
 find_package(Boost COMPONENTS system program_options regex REQUIRED QUIET)
-find_package(Thrift REQUIRED)
+if(MSVC)
+  find_package(Thrift CONFIG REQUIRED)
+else()
+  find_package(Thrift REQUIRED)
+endif()
 include_directories(${Thrift_INCLUDE_DIRS})
 if("${Thrift_version}" VERSION_LESS "0.11.0")
   add_definitions("-DHAVE_THRIFT_BOOST_SHAREDPTR")
@@ -52,10 +56,10 @@ target_link_libraries(StreamInsertSimple mapd_sample_thrift ${Boost_LIBRARIES} $
 target_link_libraries(StreamInsert mapd_sample_thrift ${CMAKE_DL_LIBS} ${Boost_LIBRARIES} ${PROFILER_LIBS})
 target_link_libraries(DataGen mapd_sample_thrift ${CMAKE_DL_LIBS} ${PROFILER_LIBS})
 
-install(TARGETS StreamInsertSimple StreamInsert DataGen DESTINATION SampleCode)
-install(DIRECTORY . DESTINATION SampleCode)
+install(TARGETS StreamInsertSimple StreamInsert DataGen DESTINATION SampleCode COMPONENT "data")
+install(DIRECTORY . DESTINATION SampleCode COMPONENT "data")
 install(
     FILES
         ${CMAKE_SOURCE_DIR}/omnisci.thrift
         ${CMAKE_SOURCE_DIR}/cmake/Modules/FindThrift.cmake
-    DESTINATION SampleCode)
+    DESTINATION SampleCode COMPONENT "data")

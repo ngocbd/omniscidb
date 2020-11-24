@@ -138,7 +138,7 @@ llvm::Value* CgenState::emitCall(const std::string& fname,
                                  const std::vector<llvm::Value*>& args) {
   // Get the implementation from the runtime module.
   auto func_impl = g_rt_module->getFunction(fname);
-  CHECK(func_impl);
+  CHECK(func_impl) << fname;
   // Get the function reference from the query module.
   auto func = module_->getFunction(fname);
   CHECK(func);
@@ -162,8 +162,8 @@ void CgenState::emitErrorCheck(llvm::Value* condition,
                                llvm::Value* errorCode,
                                std::string label) {
   needs_error_check_ = true;
-  auto check_ok = llvm::BasicBlock::Create(context_, label + "_ok", row_func_);
-  auto check_fail = llvm::BasicBlock::Create(context_, label + "_fail", row_func_);
+  auto check_ok = llvm::BasicBlock::Create(context_, label + "_ok", current_func_);
+  auto check_fail = llvm::BasicBlock::Create(context_, label + "_fail", current_func_);
   ir_builder_.CreateCondBr(condition, check_ok, check_fail);
   ir_builder_.SetInsertPoint(check_fail);
   ir_builder_.CreateRet(errorCode);

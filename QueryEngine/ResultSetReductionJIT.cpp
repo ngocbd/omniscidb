@@ -25,7 +25,6 @@
 #include "LLVMFunctionAttributesUtil.h"
 
 #include "Shared/likely.h"
-#include "Shared/mapdpath.h"
 
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/Function.h>
@@ -351,8 +350,8 @@ std::unique_ptr<Function> setup_reduce_loop(ReductionCode* reduction_code) {
                          /*always_inline=*/false);
 }
 
-llvm::Function* create_llvm_function(const Function* function,
-                                     const CgenState* cgen_state) {
+llvm::Function* create_llvm_function(const Function* function, CgenState* cgen_state) {
+  AUTOMATIC_IR_METADATA(cgen_state);
   auto& ctx = cgen_state->context_;
   std::vector<llvm::Type*> parameter_types;
   const auto& arg_types = function->arg_types();
@@ -468,16 +467,17 @@ extern "C" void get_group_value_reduction_rt(int8_t* groups_buffer,
                                              int64_t** buff_out,
                                              uint8_t* empty) {
   const auto& this_qmd = *reinterpret_cast<const QueryMemoryDescriptor*>(this_qmd_handle);
-  const auto gvi = get_group_value_reduction(reinterpret_cast<int64_t*>(groups_buffer),
-                                             this_qmd.getEntryCount(),
-                                             reinterpret_cast<const int64_t*>(key),
-                                             key_count,
-                                             this_qmd.getEffectiveKeyWidth(),
-                                             this_qmd,
-                                             reinterpret_cast<const int64_t*>(that_buff),
-                                             that_entry_idx,
-                                             that_entry_count,
-                                             row_size_bytes >> 3);
+  const auto gvi =
+      result_set::get_group_value_reduction(reinterpret_cast<int64_t*>(groups_buffer),
+                                            this_qmd.getEntryCount(),
+                                            reinterpret_cast<const int64_t*>(key),
+                                            key_count,
+                                            this_qmd.getEffectiveKeyWidth(),
+                                            this_qmd,
+                                            reinterpret_cast<const int64_t*>(that_buff),
+                                            that_entry_idx,
+                                            that_entry_count,
+                                            row_size_bytes >> 3);
   *buff_out = gvi.first;
   *empty = gvi.second;
 }
@@ -577,6 +577,7 @@ ReductionCode ResultSetReductionJIT::codegen() const {
   auto cgen_state = reduction_code.cgen_state.get();
   std::unique_ptr<llvm::Module> module = runtime_module_shallow_copy(cgen_state);
   cgen_state->module_ = module.get();
+  AUTOMATIC_IR_METADATA(cgen_state);
   auto ir_is_empty = create_llvm_function(reduction_code.ir_is_empty.get(), cgen_state);
   auto ir_reduce_one_entry =
       create_llvm_function(reduction_code.ir_reduce_one_entry.get(), cgen_state);
@@ -600,6 +601,7 @@ ReductionCode ResultSetReductionJIT::codegen() const {
       reduction_code.ir_reduce_loop.get(), ir_reduce_loop, reduction_code, f);
   reduction_code.llvm_reduce_loop = ir_reduce_loop;
   reduction_code.module = std::move(module);
+  AUTOMATIC_IR_METADATA_DONE();
   return finalizeReductionCode(std::move(reduction_code),
                                ir_is_empty,
                                ir_reduce_one_entry,
@@ -628,8 +630,8 @@ void ResultSetReductionJIT::isEmpty(const ReductionCode& reduction_code) const {
     CHECK_GE(query_mem_desc_.getTargetIdxForKey(), 0);
     CHECK_LT(static_cast<size_t>(query_mem_desc_.getTargetIdxForKey()),
              target_init_vals_.size());
-    const int64_t target_slot_off =
-        get_byteoff_of_slot(query_mem_desc_.getTargetIdxForKey(), query_mem_desc_);
+    const int64_t target_slot_off = result_set::get_byteoff_of_slot(
+        query_mem_desc_.getTargetIdxForKey(), query_mem_desc_);
     const auto slot_ptr = ir_is_empty->add<GetElementPtr>(
         keys_ptr,
         ir_is_empty->addConstant<ConstantInt>(target_slot_off, Type::Int32),
@@ -850,9 +852,11 @@ void ResultSetReductionJIT::reduceOneEntryNoCollisionsIdx(
   const auto that_qmd_handle = ir_reduce_one_entry_idx->arg(5);
   const auto serialized_varlen_buffer_arg = ir_reduce_one_entry_idx->arg(6);
   const auto row_bytes = ir_reduce_one_entry_idx->addConstant<ConstantInt>(
-      get_row_bytes(query_mem_desc_), Type::Int32);
+      get_row_bytes(query_mem_desc_), Type::Int64);
+  const auto entry_idx_64 = ir_reduce_one_entry_idx->add<Cast>(
+      Cast::CastOp::SExt, entry_idx, Type::Int64, "entry_idx_64");
   const auto row_off_in_bytes = ir_reduce_one_entry_idx->add<BinaryOperator>(
-      BinaryOperator::BinaryOp::Mul, entry_idx, row_bytes, "row_off_in_bytes");
+      BinaryOperator::BinaryOp::Mul, entry_idx_64, row_bytes, "row_off_in_bytes");
   const auto this_row_ptr = ir_reduce_one_entry_idx->add<GetElementPtr>(
       this_buff, row_off_in_bytes, "this_row_ptr");
   const auto that_row_ptr = ir_reduce_one_entry_idx->add<GetElementPtr>(
@@ -883,9 +887,14 @@ void ResultSetReductionJIT::reduceOneEntryBaselineIdx(
   const auto that_qmd_handle = ir_reduce_one_entry_idx->arg(5);
   const auto serialized_varlen_buffer_arg = ir_reduce_one_entry_idx->arg(6);
   const auto row_bytes = ir_reduce_one_entry_idx->addConstant<ConstantInt>(
-      get_row_bytes(query_mem_desc_), Type::Int32);
-  const auto that_row_off_in_bytes = ir_reduce_one_entry_idx->add<BinaryOperator>(
-      BinaryOperator::BinaryOp::Mul, that_entry_idx, row_bytes, "that_row_off_in_bytes");
+      get_row_bytes(query_mem_desc_), Type::Int64);
+  const auto that_entry_idx_64 = ir_reduce_one_entry_idx->add<Cast>(
+      Cast::CastOp::SExt, that_entry_idx, Type::Int64, "that_entry_idx_64");
+  const auto that_row_off_in_bytes =
+      ir_reduce_one_entry_idx->add<BinaryOperator>(BinaryOperator::BinaryOp::Mul,
+                                                   that_entry_idx_64,
+                                                   row_bytes,
+                                                   "that_row_off_in_bytes");
   const auto that_row_ptr = ir_reduce_one_entry_idx->add<GetElementPtr>(
       that_buff, that_row_off_in_bytes, "that_row_ptr");
   const auto that_is_empty =
@@ -1039,8 +1048,8 @@ void ResultSetReductionJIT::reduceOneSlot(Value* this_ptr1,
     }
   }
   const bool float_argument_input = takes_float_argument(target_info);
-  const auto chosen_bytes =
-      get_width_for_slot(target_slot_idx, float_argument_input, query_mem_desc_);
+  const auto chosen_bytes = result_set::get_width_for_slot(
+      target_slot_idx, float_argument_input, query_mem_desc_);
   CHECK_LT(init_agg_val_idx, target_init_vals_.size());
   auto init_val = target_init_vals_[init_agg_val_idx];
   if (target_info.is_agg &&
@@ -1194,6 +1203,18 @@ ReductionCode ResultSetReductionJIT::finalizeReductionCode(
     const CodeCacheKey& key) const {
   CompilationOptions co{
       ExecutorDeviceType::CPU, false, ExecutorOptLevel::ReductionJIT, false};
+
+#ifdef NDEBUG
+  LOG(IR) << "Reduction Loop:\n"
+          << serialize_llvm_object(reduction_code.llvm_reduce_loop);
+  LOG(IR) << "Reduction Is Empty Func:\n" << serialize_llvm_object(ir_is_empty);
+  LOG(IR) << "Reduction One Entry Func:\n" << serialize_llvm_object(ir_reduce_one_entry);
+  LOG(IR) << "Reduction One Entry Idx Func:\n"
+          << serialize_llvm_object(ir_reduce_one_entry_idx);
+#else
+  LOG(IR) << serialize_llvm_object(reduction_code.cgen_state->module_);
+#endif
+
   reduction_code.module.release();
   auto ee = CodeGenerator::generateNativeCPUCode(
       reduction_code.llvm_reduce_loop, {reduction_code.llvm_reduce_loop}, co);
@@ -1257,6 +1278,7 @@ ReductionCode GpuReductionHelperJIT::codegen() const {
   std::unique_ptr<llvm::Module> module(runtime_module_shallow_copy(cgen_state));
 
   cgen_state->module_ = module.get();
+  AUTOMATIC_IR_METADATA(cgen_state);
   auto ir_is_empty = create_llvm_function(reduction_code.ir_is_empty.get(), cgen_state);
   auto ir_reduce_one_entry =
       create_llvm_function(reduction_code.ir_reduce_one_entry.get(), cgen_state);

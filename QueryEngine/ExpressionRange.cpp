@@ -516,6 +516,8 @@ int64_t get_conservative_datetrunc_bucket(const DatetruncField datetrunc_field) 
     case dtDECADE:
       return 10 * year_days * day_seconds;
     case dtWEEK:
+    case dtWEEK_SUNDAY:
+    case dtWEEK_SATURDAY:
       return 7 * day_seconds;
     case dtQUARTERDAY:
       return 4 * 60 * 50;
@@ -553,15 +555,15 @@ ExpressionRange getLeafColumnRange(const Analyzer::ColumnVar* col_expr,
     case kTIME:
     case kFLOAT:
     case kDOUBLE: {
-      ssize_t ti_idx = -1;
+      std::optional<size_t> ti_idx;
       for (size_t i = 0; i < query_infos.size(); ++i) {
         if (col_expr->get_table_id() == query_infos[i].table_id) {
           ti_idx = i;
           break;
         }
       }
-      CHECK_NE(ssize_t(-1), ti_idx);
-      const auto& query_info = query_infos[ti_idx].info;
+      CHECK(ti_idx);
+      const auto& query_info = query_infos[*ti_idx].info;
       const auto& fragments = query_info.fragments;
       const auto cd = executor->getColumnDescriptor(col_expr);
       if (cd && cd->isVirtualCol) {
@@ -916,6 +918,8 @@ ExpressionRange getExpressionRange(
     case kDOY:
       return ExpressionRange::makeIntRange(1, 366, 0, has_nulls);
     case kWEEK:
+    case kWEEK_SUNDAY:
+    case kWEEK_SATURDAY:
       return ExpressionRange::makeIntRange(1, 53, 0, has_nulls);
     default:
       CHECK(false);

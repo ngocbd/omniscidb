@@ -23,12 +23,12 @@
 
 #include "Calcite.h"
 #include "Catalog/Catalog.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
+#include "OSDependent/omnisci_path.h"
 #include "Shared/SystemParameters.h"
 #include "Shared/ThriftClient.h"
 #include "Shared/fixautotools.h"
 #include "Shared/mapd_shared_ptr.h"
-#include "Shared/mapdpath.h"
 #include "Shared/measure.h"
 #include "ThriftHandler/QueryState.h"
 
@@ -36,6 +36,10 @@
 #include <thrift/transport/TSocket.h>
 #include <thrift/transport/TTransportUtils.h>
 #include <type_traits>
+
+#ifdef _MSC_VER
+#include <process.h>
+#endif
 
 #include "gen-cpp/CalciteServer.h"
 
@@ -76,15 +80,16 @@ static void start_calcite_server_as_daemon(const int db_port,
                                            const std::string& ssl_key_file,
                                            const std::string& db_config_file,
                                            const std::string& udf_filename) {
+  auto root_abs_path = omnisci::get_root_abs_path();
   std::string const xDebug = "-Xdebug";
   std::string const remoteDebug =
       "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005";
   std::string xmxP = "-Xmx" + std::to_string(calcite_max_mem) + "m";
   std::string jarP = "-jar";
   std::string jarD =
-      mapd_root_abs_path() + "/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar";
+      root_abs_path + "/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar";
   std::string extensionsP = "-e";
-  std::string extensionsD = mapd_root_abs_path() + "/QueryEngine/";
+  std::string extensionsD = root_abs_path + "/QueryEngine/";
   std::string dataP = "-d";
   std::string dataD = data_dir;
   std::string localPortP = "-p";
@@ -109,7 +114,66 @@ static void start_calcite_server_as_daemon(const int db_port,
   // otherwise send an empty string and Calcite should get it from the config file.
   std::string key_store_password = (db_config_file == "") ? ssl_keystore_password_X : "";
   std::string trust_store_password = (db_config_file == "") ? ssl_trust_password_X : "";
-
+#ifdef _MSC_VER
+  // TODO: enable UDF support
+  std::vector<std::string> args_vec;
+  args_vec.push_back("java");
+  args_vec.push_back(xDebug);
+  args_vec.push_back(remoteDebug);
+  args_vec.push_back(xmxP);
+  args_vec.push_back(logDirectory);
+  args_vec.push_back(jarP);
+  args_vec.push_back(jarD);
+  args_vec.push_back(extensionsP);
+  args_vec.push_back(extensionsD);
+  args_vec.push_back(dataP);
+  args_vec.push_back(dataD);
+  args_vec.push_back(localPortP);
+  args_vec.push_back(localPortD);
+  args_vec.push_back(dbPortP);
+  args_vec.push_back(dbPortD);
+  if (!ssl_trust_store.empty()) {
+    args_vec.push_back(TrustStoreP);
+    args_vec.push_back(ssl_trust_store);
+  }
+  if (!trust_store_password.empty()) {
+    args_vec.push_back(TrustPasswdP);
+    args_vec.push_back(trust_store_password);
+  }
+  if (!ssl_keystore.empty()) {
+    args_vec.push_back(KeyStoreP);
+    args_vec.push_back(ssl_keystore);
+  }
+  if (!key_store_password.empty()) {
+    args_vec.push_back(KeyStorePasswdP);
+    args_vec.push_back(key_store_password);
+  }
+  if (!db_config_file.empty()) {
+    args_vec.push_back(ConfigFileP);
+    args_vec.push_back(db_config_file);
+  }
+  std::string args{boost::algorithm::join(args_vec, " ")};
+  STARTUPINFO startup_info;
+  PROCESS_INFORMATION proc_info;
+  ZeroMemory(&startup_info, sizeof(startup_info));
+  startup_info.cb = sizeof(startup_info);
+  ZeroMemory(&proc_info, sizeof(proc_info));
+  LOG(INFO) << "Startup command: " << args;
+  std::wstring wargs = std::wstring(args.begin(), args.end());
+  const auto ret = CreateProcess(NULL,
+                                 (LPWSTR)wargs.c_str(),
+                                 NULL,
+                                 NULL,
+                                 false,
+                                 0,
+                                 NULL,
+                                 NULL,
+                                 &startup_info,
+                                 &proc_info);
+  if (ret == 0) {
+    LOG(FATAL) << "Failed to start Calcite server " << GetLastError();
+  }
+#else
   int pid = fork();
   if (pid == 0) {
     int i;
@@ -180,12 +244,19 @@ static void start_calcite_server_as_daemon(const int db_port,
       LOG(INFO) << "Successfully started Calcite server";
     }
   }
+#endif
 }
 
 std::pair<mapd::shared_ptr<CalciteServerClient>, mapd::shared_ptr<TTransport>>
 Calcite::getClient(int port) {
-  const auto transport = connMgr_->open_buffered_client_transport(
-      "localhost", port, ssl_ca_file_, true, 2000, service_timeout_, service_timeout_);
+  const auto transport = connMgr_->open_buffered_client_transport("localhost",
+                                                                  port,
+                                                                  ssl_ca_file_,
+                                                                  true,
+                                                                  service_keepalive_,
+                                                                  2000,
+                                                                  service_timeout_,
+                                                                  service_timeout_);
   try {
     transport->open();
 
@@ -285,8 +356,11 @@ Calcite::Calcite(const int db_port,
                  const std::string& data_dir,
                  const size_t calcite_max_mem,
                  const size_t service_timeout,
+                 const bool service_keepalive,
                  const std::string& udf_filename)
-    : server_available_(false), service_timeout_(service_timeout) {
+    : server_available_(false)
+    , service_timeout_(service_timeout)
+    , service_keepalive_(service_keepalive) {
   init(db_port, calcite_port, data_dir, calcite_max_mem, udf_filename);
 }
 
@@ -316,6 +390,7 @@ Calcite::Calcite(const SystemParameters& system_parameters,
                  const std::string& data_dir,
                  const std::string& udf_filename)
     : service_timeout_(system_parameters.calcite_timeout)
+    , service_keepalive_(system_parameters.calcite_keepalive)
     , ssl_trust_store_(system_parameters.ssl_trust_store)
     , ssl_trust_password_(system_parameters.ssl_trust_password)
     , ssl_key_file_(system_parameters.ssl_key_file)

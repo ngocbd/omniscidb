@@ -27,6 +27,7 @@
 #include <boost/program_options.hpp>
 
 #include "Catalog/AuthMetadata.h"
+#include "DataMgr/ForeignStorage/ForeignStorageCache.h"
 #include "QueryEngine/ExtractFromTime.h"
 #include "QueryEngine/HyperLogLog.h"
 #include "Shared/SystemParameters.h"
@@ -45,9 +46,11 @@ class CommandLineOptions {
   int http_port = 6278;
   size_t reserved_gpu_mem = 384 * 1024 * 1024;
   std::string base_path;
+  DiskCacheConfig disk_cache_config;
   std::string cluster_file = {"cluster.conf"};
   std::string cluster_topology_file = {"cluster_topology.conf"};
   std::string license_path = {""};
+  std::string encryption_key_store_path = {};
   bool cpu_only = false;
   bool verbose_logging = false;
   bool jit_debug = false;
@@ -56,6 +59,7 @@ class CommandLineOptions {
   bool read_only = false;
   bool allow_loop_joins = false;
   bool enable_legacy_syntax = true;
+  bool log_user_origin = true;
   AuthMetadata authMetadata;
 
   SystemParameters system_parameters;
@@ -65,6 +69,7 @@ class CommandLineOptions {
   size_t render_mem_bytes = 1000000000;
   size_t max_concurrent_render_sessions = 500;
   bool render_compositor_use_last_gpu = true;
+  bool renderer_use_vulkan_driver = false;
 
   bool enable_runtime_udf = false;
 
@@ -72,8 +77,10 @@ class CommandLineOptions {
   bool enable_dynamic_watchdog = false;
   bool enable_runtime_query_interrupt = false;
   bool use_estimator_result_cache = true;
-  unsigned runtime_query_interrupt_frequency = 1000;  // in milliseconds
+  double running_query_interrupt_freq = 0.5;     // 0.0 ~ 1.0
+  unsigned pending_query_interrupt_freq = 1000;  // in milliseconds
   unsigned dynamic_watchdog_time_limit = 10000;
+  std::string disk_cache_level = "";
 
   /**
    * Can be used to override the number of gpus detected on the system
@@ -165,14 +172,14 @@ extern size_t g_max_memory_allocation_size;
 extern double g_bump_allocator_step_reduction;
 extern bool g_enable_direct_columnarization;
 extern bool g_enable_runtime_query_interrupt;
-extern unsigned g_runtime_query_interrupt_frequency;
+extern unsigned g_pending_query_interrupt_freq;
+extern double g_running_query_interrupt_freq;
 extern size_t g_gpu_smem_threshold;
 extern bool g_enable_smem_non_grouped_agg;
 extern bool g_enable_smem_grouped_non_count_agg;
 extern bool g_use_estimator_result_cache;
 
 extern int64_t g_omni_kafka_seek;
-extern bool g_cache_string_hash;
 extern size_t g_leaf_count;
 extern size_t g_compression_limit_bytes;
 extern bool g_skip_intermediate_count;
@@ -185,3 +192,4 @@ extern bool g_enable_fsi;
 extern bool g_enable_interop;
 extern bool g_enable_union;
 extern bool g_use_tbb_pool;
+extern bool g_enable_filter_function;

@@ -22,7 +22,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/Support/raw_os_ostream.h>
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 #if LLVM_VERSION_MAJOR >= 10
 #define LLVM_ALIGN(alignment) llvm::Align(alignment)
@@ -61,18 +61,18 @@ inline llvm::VectorType* get_int_vector_type(int const width,
                                              llvm::LLVMContext& context) {
   switch (width) {
     case 64:
-      return llvm::VectorType::get(llvm::Type::getInt64Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt64Ty(context), count, false);
     case 32:
-      return llvm::VectorType::get(llvm::Type::getInt32Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt32Ty(context), count, false);
       break;
     case 16:
-      return llvm::VectorType::get(llvm::Type::getInt16Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt16Ty(context), count, false);
       break;
     case 8:
-      return llvm::VectorType::get(llvm::Type::getInt8Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt8Ty(context), count, false);
       break;
     case 1:
-      return llvm::VectorType::get(llvm::Type::getInt1Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt1Ty(context), count, false);
       break;
     default:
       LOG(FATAL) << "Unsupported integer width: " << width;
@@ -131,11 +131,11 @@ llvm::Module* read_template_module(llvm::LLVMContext& context);
 
 template <class T>
 std::string serialize_llvm_object(const T* llvm_obj) {
-  std::stringstream ss;
-  llvm::raw_os_ostream os(ss);
-  llvm_obj->print(os);
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  os << *llvm_obj;
   os.flush();
-  return ss.str();
+  return str;
 }
 
 void verify_function_ir(const llvm::Function* func);

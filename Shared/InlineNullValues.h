@@ -17,10 +17,13 @@
 #ifndef INLINENULLVALUES_H
 #define INLINENULLVALUES_H
 
-#include "Logger.h"
+#include "Logger/Logger.h"
 
 template <typename T>
-T inline_fp_null_value();
+constexpr inline T inline_fp_null_value() {
+  LOG(FATAL) << "Only float or double overloads should be called.";
+  return T{};
+}
 
 template <>
 constexpr inline float inline_fp_null_value<float>() {
@@ -33,7 +36,10 @@ constexpr inline double inline_fp_null_value<double>() {
 }
 
 template <typename T>
-T inline_fp_null_array_value();
+T inline_fp_null_array_value() {
+  LOG(FATAL) << "Only float or double overloads should be called.";
+  return T{};
+}
 
 template <>
 constexpr inline float inline_fp_null_array_value<float>() {

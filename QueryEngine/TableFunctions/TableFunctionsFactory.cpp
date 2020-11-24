@@ -26,10 +26,8 @@ namespace table_functions {
 namespace {
 
 SQLTypeInfo ext_arg_pointer_type_to_type_info(const ExtArgumentType ext_arg_type) {
-  auto generate_column_type = [](const auto subtype) {
-    auto ti = SQLTypeInfo(kCOLUMN, false);
-    ti.set_subtype(subtype);
-    return ti;
+  auto generate_column_type = [](const auto& subtype) {
+    return SQLTypeInfo(kCOLUMN, 0, 0, false, kENCODING_NONE, 0, subtype);
   };
   switch (ext_arg_type) {
     case ExtArgumentType::PInt8:
@@ -44,6 +42,8 @@ SQLTypeInfo ext_arg_pointer_type_to_type_info(const ExtArgumentType ext_arg_type
       return SQLTypeInfo(kFLOAT, false);
     case ExtArgumentType::PDouble:
       return SQLTypeInfo(kDOUBLE, false);
+    case ExtArgumentType::PBool:
+      return SQLTypeInfo(kBOOLEAN, false);
     case ExtArgumentType::ColumnInt8:
       return generate_column_type(kTINYINT);
     case ExtArgumentType::ColumnInt16:
@@ -59,6 +59,49 @@ SQLTypeInfo ext_arg_pointer_type_to_type_info(const ExtArgumentType ext_arg_type
     case ExtArgumentType::ColumnBool:
       return generate_column_type(kBOOLEAN);
     default:
+      LOG(WARNING) << "ext_arg_pointer_type_to_type_info: ExtArgumentType `"
+                   << ExtensionFunctionsWhitelist::toString(ext_arg_type)
+                   << "` conversion to SQLTypeInfo not implemented.";
+      UNREACHABLE();
+  }
+  UNREACHABLE();
+  return SQLTypeInfo(kNULLT, false);
+}
+
+SQLTypeInfo ext_arg_type_to_type_info_output(const ExtArgumentType ext_arg_type) {
+  switch (ext_arg_type) {
+    case ExtArgumentType::PInt8:
+    case ExtArgumentType::ColumnInt8:
+    case ExtArgumentType::Int8:
+      return SQLTypeInfo(kTINYINT, false);
+    case ExtArgumentType::PInt16:
+    case ExtArgumentType::ColumnInt16:
+    case ExtArgumentType::Int16:
+      return SQLTypeInfo(kSMALLINT, false);
+    case ExtArgumentType::PInt32:
+    case ExtArgumentType::ColumnInt32:
+    case ExtArgumentType::Int32:
+      return SQLTypeInfo(kINT, false);
+    case ExtArgumentType::PInt64:
+    case ExtArgumentType::ColumnInt64:
+    case ExtArgumentType::Int64:
+      return SQLTypeInfo(kBIGINT, false);
+    case ExtArgumentType::PFloat:
+    case ExtArgumentType::ColumnFloat:
+    case ExtArgumentType::Float:
+      return SQLTypeInfo(kFLOAT, false);
+    case ExtArgumentType::PDouble:
+    case ExtArgumentType::ColumnDouble:
+    case ExtArgumentType::Double:
+      return SQLTypeInfo(kDOUBLE, false);
+    case ExtArgumentType::PBool:
+    case ExtArgumentType::ColumnBool:
+    case ExtArgumentType::Bool:
+      return SQLTypeInfo(kBOOLEAN, false);
+    default:
+      LOG(WARNING) << "ext_arg_pointer_type_to_type_info: ExtArgumentType `"
+                   << ExtensionFunctionsWhitelist::toString(ext_arg_type)
+                   << "` conversion to SQLTypeInfo not implemented.";
       UNREACHABLE();
   }
   UNREACHABLE();
@@ -75,7 +118,7 @@ SQLTypeInfo TableFunction::getInputSQLType(const size_t idx) const {
 SQLTypeInfo TableFunction::getOutputSQLType(const size_t idx) const {
   CHECK_LT(idx, output_args_.size());
   // TODO(adb): conditionally handle nulls
-  return ext_arg_pointer_type_to_type_info(output_args_[idx]);
+  return ext_arg_type_to_type_info_output(output_args_[idx]);
 }
 
 void TableFunctionsFactory::add(const std::string& name,
@@ -83,8 +126,22 @@ void TableFunctionsFactory::add(const std::string& name,
                                 const std::vector<ExtArgumentType>& input_args,
                                 const std::vector<ExtArgumentType>& output_args,
                                 bool is_runtime) {
-  functions_.insert(std::make_pair(
-      name, TableFunction(name, sizer, input_args, output_args, is_runtime)));
+  for (auto it = functions_.begin(); it != functions_.end();) {
+    if (it->second.getName() == name) {
+      if (it->second.isRuntime()) {
+        VLOG(1) << "Overriding existing run-time table function (reset not called?): "
+                << name;
+        it = functions_.erase(it);
+      } else {
+        throw std::runtime_error("Will not override existing load-time table function: " +
+                                 name);
+      }
+    } else {
+      ++it;
+    }
+  }
+  auto tf = TableFunction(name, sizer, input_args, output_args, is_runtime);
+  functions_.emplace(name, tf);
 }
 
 std::once_flag init_flag;
@@ -95,31 +152,74 @@ void TableFunctionsFactory::init() {
   }
   std::call_once(init_flag, []() {
     TableFunctionsFactory::add(
-        "row_copierOLDAPI",
-        TableFunctionOutputRowSizer{OutputBufferSizeType::kUserSpecifiedRowMultiplier, 2},
-        std::vector<ExtArgumentType>{ExtArgumentType::PDouble,
-                                     ExtArgumentType::PInt32,
-                                     ExtArgumentType::PInt64,
-                                     ExtArgumentType::PInt64},
-        std::vector<ExtArgumentType>{ExtArgumentType::PDouble});
-    TableFunctionsFactory::add(
         "row_copier",
         TableFunctionOutputRowSizer{OutputBufferSizeType::kUserSpecifiedRowMultiplier, 2},
         std::vector<ExtArgumentType>{ExtArgumentType::ColumnDouble,
                                      ExtArgumentType::Int32},
-        std::vector<ExtArgumentType>{ExtArgumentType::ColumnDouble});
+        std::vector<ExtArgumentType>{ExtArgumentType::Double});
+    TableFunctionsFactory::add(
+        "row_adder",
+        TableFunctionOutputRowSizer{OutputBufferSizeType::kUserSpecifiedRowMultiplier, 1},
+        std::vector<ExtArgumentType>{ExtArgumentType::Int32,
+                                     ExtArgumentType::ColumnDouble,
+                                     ExtArgumentType::ColumnDouble},
+        std::vector<ExtArgumentType>{ExtArgumentType::Double});
+    TableFunctionsFactory::add(
+        "row_addsub",
+        TableFunctionOutputRowSizer{OutputBufferSizeType::kUserSpecifiedRowMultiplier, 1},
+        std::vector<ExtArgumentType>{ExtArgumentType::Int32,
+                                     ExtArgumentType::ColumnDouble,
+                                     ExtArgumentType::ColumnDouble},
+        std::vector<ExtArgumentType>{ExtArgumentType::Double, ExtArgumentType::Double});
+    TableFunctionsFactory::add(
+        "get_max_with_row_offset",
+        TableFunctionOutputRowSizer{OutputBufferSizeType::kConstant, 1},
+        std::vector<ExtArgumentType>{ExtArgumentType::ColumnInt32},
+        // ExtArgumentType::Int32},
+        std::vector<ExtArgumentType>{ExtArgumentType::Int32, ExtArgumentType::Int32});
   });
 }
 
-const TableFunction& TableFunctionsFactory::get(const std::string& name) {
-  auto func_name = name;
-  boost::algorithm::to_lower(func_name);
-  auto itr = functions_.find(func_name);
-  if (itr == functions_.end()) {
-    throw std::runtime_error("Failed to find registered table function with name " +
-                             name);
+// removes existing runtime table functions
+void TableFunctionsFactory::reset() {
+  if (!g_enable_table_functions) {
+    return;
   }
-  return itr->second;
+  for (auto it = functions_.begin(); it != functions_.end();) {
+    if (it->second.isRuntime()) {
+      it = functions_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+namespace {
+
+std::string drop_suffix(const std::string& str) {
+  const auto idx = str.find("__");
+  if (idx == std::string::npos) {
+    return str;
+  }
+  CHECK_GT(idx, std::string::size_type(0));
+  return str.substr(0, idx);
+}
+
+}  // namespace
+
+std::vector<TableFunction> TableFunctionsFactory::get_table_funcs(const std::string& name,
+                                                                  const bool is_gpu) {
+  std::vector<TableFunction> table_funcs;
+  auto table_func_name = name;
+  boost::algorithm::to_lower(table_func_name);
+  for (const auto& pair : functions_) {
+    auto fname = drop_suffix(pair.first);
+    if (fname == table_func_name &&
+        (is_gpu ? pair.second.isGPU() : pair.second.isCPU())) {
+      table_funcs.push_back(pair.second);
+    }
+  }
+  return table_funcs;
 }
 
 std::unordered_map<std::string, TableFunction> TableFunctionsFactory::functions_;

@@ -34,7 +34,7 @@
 #include "QueryEngine/Rendering/RenderInfo.h"
 #include "QueryEngine/TargetMetaInfo.h"
 #include "QueryEngine/TypePunning.h"
-#include "Shared/sql_window_function_to_string.h"
+#include "Shared/toString.h"
 #include "Utils/FsiUtils.h"
 
 using ColumnNameList = std::vector<std::string>;
@@ -47,7 +47,6 @@ class Rex {
 };
 
 class RexScalar : public Rex {};
-
 // For internal use of the abstract interpreter only. The result after abstract
 // interpretation will not have any references to 'RexAbstractInput' objects.
 class RexAbstractInput : public RexScalar {
@@ -59,7 +58,7 @@ class RexAbstractInput : public RexScalar {
   void setIndex(const unsigned in_index) const { in_index_ = in_index; }
 
   std::string toString() const override {
-    return "(RexAbstractInput " + std::to_string(in_index_) + ")";
+    return cat(::typeName(this), "(", std::to_string(in_index_), ")");
   }
 
  private:
@@ -166,7 +165,14 @@ class RexLiteral : public RexScalar {
   unsigned getTypePrecision() const { return type_precision_; }
 
   std::string toString() const override {
-    return "(RexLiteral " + boost::lexical_cast<std::string>(literal_) + ")";
+    return cat(::typeName(this),
+               "(",
+               boost::lexical_cast<std::string>(literal_),
+               ", type=",
+               (type_ == kNULLT ? "null" : ::toString(type_)),
+               ", target_type=",
+               (target_type_ == kNULLT ? "null" : ::toString(target_type_)),
+               ")");
   }
 
   std::unique_ptr<RexLiteral> deepCopy() const {
@@ -242,11 +248,14 @@ class RexOperator : public RexScalar {
   const SQLTypeInfo& getType() const { return type_; }
 
   std::string toString() const override {
-    std::string result = "(RexOperator " + std::to_string(op_);
-    for (const auto& operand : operands_) {
-      result += " " + operand->toString();
-    }
-    return result + ")";
+    return cat(::typeName(this),
+               "(",
+               std::to_string(op_),
+               ", operands=",
+               ::toString(operands_),
+               ", type=",
+               type_.to_string(),
+               ")");
   };
 
  protected:
@@ -296,10 +305,7 @@ class RexSubQuery : public RexScalar {
 
   const RelAlgNode* getRelAlg() const { return ra_.get(); }
 
-  std::string toString() const override {
-    return "(RexSubQuery " + std::to_string(reinterpret_cast<const uint64_t>(this)) +
-           " id(" + std::to_string(getId()) + "))";
-  }
+  std::string toString() const override;
 
   std::unique_ptr<RexSubQuery> deepCopy() const;
 
@@ -329,10 +335,7 @@ class RexInput : public RexAbstractInput {
     return getSourceNode() == that.getSourceNode() && getIndex() == that.getIndex();
   }
 
-  std::string toString() const override {
-    return "(RexInput " + std::to_string(getIndex()) + " " +
-           std::to_string(reinterpret_cast<const uint64_t>(node_)) + ")";
-  }
+  std::string toString() const override;
 
   std::unique_ptr<RexInput> deepCopy() const {
     return std::make_unique<RexInput>(node_, getIndex());
@@ -378,15 +381,12 @@ class RexCase : public RexScalar {
   const RexScalar* getElse() const { return else_expr_.get(); }
 
   std::string toString() const override {
-    std::string ret = "(RexCase";
-    for (const auto& expr_pair : expr_pair_list_) {
-      ret += " " + expr_pair.first->toString() + " -> " + expr_pair.second->toString();
-    }
-    if (else_expr_) {
-      ret += " else " + else_expr_->toString();
-    }
-    ret += ")";
-    return ret;
+    return cat(::typeName(this),
+               "(expr_pair_list=",
+               ::toString(expr_pair_list_),
+               ", else_expr=",
+               (else_expr_ ? else_expr_->toString() : "null"),
+               ")");
   }
 
  private:
@@ -415,11 +415,7 @@ class RexFunctionOperator : public RexOperator {
   const std::string& getName() const { return name_; }
 
   std::string toString() const override {
-    auto result = "(RexFunctionOperator " + name_;
-    for (const auto& operand : operands_) {
-      result += (" " + operand->toString());
-    }
-    return result + ")";
+    return cat(::typeName(this), "(", name_, ", operands=", ::toString(operands_), ")");
   }
 
  private:
@@ -449,9 +445,14 @@ class SortField {
   NullSortedPosition getNullsPosition() const { return nulls_pos_; }
 
   std::string toString() const {
-    return "(" + std::to_string(field_) + " " +
-           (sort_dir_ == SortDirection::Ascending ? "asc" : "desc") + " " +
-           (nulls_pos_ == NullSortedPosition::First ? "nulls_first" : "nulls_last") + ")";
+    return cat(::typeName(this),
+               "(",
+               std::to_string(field_),
+               ", sort_dir=",
+               (sort_dir_ == SortDirection::Ascending ? "asc" : "desc"),
+               ", null_pos=",
+               (nulls_pos_ == NullSortedPosition::First ? "nulls_first" : "nulls_last"),
+               ")");
   }
 
  private:
@@ -480,7 +481,7 @@ class RexWindowFunctionOperator : public RexFunctionOperator {
                             const RexWindowBound& upper_bound,
                             const bool is_rows,
                             const SQLTypeInfo& ti)
-      : RexFunctionOperator(sql_window_function_to_str(kind), operands, ti)
+      : RexFunctionOperator(::toString(kind), operands, ti)
       , kind_(kind)
       , partition_keys_(std::move(partition_keys))
       , order_keys_(std::move(order_keys))
@@ -529,21 +530,16 @@ class RexWindowFunctionOperator : public RexFunctionOperator {
   }
 
   std::string toString() const override {
-    auto result = "(RexWindowFunctionOperator " + getName();
-    for (const auto& operand : operands_) {
-      result += (" " + operand->toString());
-    }
-    result += " partition[";
-    for (const auto& partition_key : partition_keys_) {
-      result += (" " + partition_key->toString());
-    }
-    result += "]";
-    result += " order[";
-    for (const auto& order_key : order_keys_) {
-      result += (" " + order_key->toString());
-    }
-    result += "]";
-    return result + ")";
+    return cat(::typeName(this),
+               "(",
+               getName(),
+               ", operands=",
+               ::toString(operands_),
+               ", partition_keys=",
+               ::toString(partition_keys_),
+               ", order_keys=",
+               ::toString(order_keys_),
+               ")");
   }
 
  private:
@@ -565,7 +561,7 @@ class RexRef : public RexScalar {
   size_t getIndex() const { return index_; }
 
   std::string toString() const override {
-    return "(RexRef " + std::to_string(index_) + ")";
+    return cat(::typeName(this), "(", std::to_string(index_), ")");
   }
 
   std::unique_ptr<RexRef> deepCopy() const { return std::make_unique<RexRef>(index_); }
@@ -583,12 +579,16 @@ class RexAgg : public Rex {
       : agg_(agg), distinct_(distinct), type_(type), operands_(operands) {}
 
   std::string toString() const override {
-    auto result = "(RexAgg " + std::to_string(agg_) + " " + std::to_string(distinct_) +
-                  " " + type_.get_type_name() + " " + type_.get_compression_name();
-    for (auto operand : operands_) {
-      result += " " + std::to_string(operand);
-    }
-    return result + ")";
+    return cat(::typeName(this),
+               "(agg=",
+               std::to_string(agg_),
+               ", distinct=",
+               std::to_string(distinct_),
+               ", type=",
+               type_.get_type_name(),
+               ", operands=",
+               ::toString(operands_),
+               ")");
   }
 
   SQLAgg getKind() const { return agg_; }
@@ -775,6 +775,12 @@ class RelAlgNode {
 
   static void resetRelAlgFirstId() noexcept;
 
+  /**
+   * Clears the ptr to the result for this descriptor. Is only used for overriding step
+   * results in distributed mode.
+   */
+  void clearContextData() const { context_data_ = nullptr; }
+
  protected:
   RelAlgInputs inputs_;
   const unsigned id_;
@@ -803,8 +809,8 @@ class RelScan : public RelAlgNode {
   const std::string getFieldName(const size_t i) const { return field_names_[i]; }
 
   std::string toString() const override {
-    return "(RelScan<" + std::to_string(reinterpret_cast<uint64_t>(this)) + "> " +
-           td_->tableName + ")";
+    return cat(
+        ::typeName(this), "(", td_->tableName, ", ", ::toString(field_names_), ")");
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
@@ -966,12 +972,8 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
                    std::unique_ptr<const RexScalar> new_input);
 
   std::string toString() const override {
-    std::string result =
-        "(RelProject<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">";
-    for (const auto& scalar_expr : scalar_exprs_) {
-      result += " " + scalar_expr->toString();
-    }
-    return result + ")";
+    return cat(
+        ::typeName(this), "(", ::toString(scalar_exprs_), ", ", ::toString(fields_), ")");
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
@@ -1073,16 +1075,16 @@ class RelAggregate : public RelAlgNode {
   }
 
   std::string toString() const override {
-    std::string result = "(RelAggregate<" +
-                         std::to_string(reinterpret_cast<uint64_t>(this)) + ">(groups: [";
-    for (size_t group_index = 0; group_index < groupby_count_; ++group_index) {
-      result += " " + std::to_string(group_index);
-    }
-    result += " ] aggs: [";
-    for (const auto& agg_expr : agg_exprs_) {
-      result += " " + agg_expr->toString();
-    }
-    return result + " ]))";
+    return cat(::typeName(this),
+               "(",
+               std::to_string(groupby_count_),
+               ", agg_exprs=",
+               ::toString(agg_exprs_),
+               ", fields=",
+               ::toString(fields_),
+               ", inputs=",
+               ::toString(inputs_),
+               ")");
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
@@ -1149,11 +1151,13 @@ class RelJoin : public RelAlgNode {
                     std::shared_ptr<const RelAlgNode> input) override;
 
   std::string toString() const override {
-    std::string result =
-        "(RelJoin<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += condition_ ? condition_->toString() : "null";
-    result += " " + std::to_string(static_cast<int>(join_type_));
-    return result + "))";
+    return cat(::typeName(this),
+               "(",
+               ::toString(inputs_),
+               ", condition=",
+               (condition_ ? condition_->toString() : "null"),
+               ", join_type=",
+               std::to_string(static_cast<int>(join_type_)));
   }
 
   size_t size() const override { return inputs_[0]->size() + inputs_[1]->size(); }
@@ -1216,10 +1220,11 @@ class RelFilter : public RelAlgNode {
                     std::shared_ptr<const RelAlgNode> input) override;
 
   std::string toString() const override {
-    std::string result =
-        "(RelFilter<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += filter_ ? filter_->toString() : "null";
-    return result + "))";
+    return cat(::typeName(this),
+               "(",
+               (filter_ ? filter_->toString() : "null"),
+               ", ",
+               ::toString(inputs_) + ")");
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
@@ -1330,23 +1335,7 @@ class RelCompound : public RelAlgNode, public ModifyManipulationTarget {
 
   bool isAggregate() const { return is_agg_; }
 
-  std::string toString() const override {
-    std::string result =
-        "(RelCompound<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += (filter_expr_ ? filter_expr_->toString() : "null") + " ";
-    for (const auto target_expr : target_exprs_) {
-      result += target_expr->toString() + " ";
-    }
-    result += "groups: [";
-    for (size_t group_index = 0; group_index < groupby_count_; ++group_index) {
-      result += " " + std::to_string(group_index);
-    }
-    result += " ] sources: [";
-    for (const auto& scalar_source : scalar_sources_) {
-      result += " " + scalar_source->toString();
-    }
-    return result + " ]))";
-  }
+  std::string toString() const override;
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
     return std::make_shared<RelCompound>(*this);
@@ -1422,17 +1411,17 @@ class RelSort : public RelAlgNode {
   size_t getOffset() const { return offset_; }
 
   std::string toString() const override {
-    std::string result =
-        "(RelSort<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += "limit: " + std::to_string(limit_) + " ";
-    result += "offset: " + std::to_string(offset_) + " ";
-    result += "empty_result: " + std::to_string(empty_result_) + " ";
-    result += "collation: [ ";
-    for (const auto& sort_field : collation_) {
-      result += sort_field.toString() + " ";
-    }
-    result += "]";
-    return result + "))";
+    return cat(::typeName(this),
+               "(",
+               "collation=",
+               ::toString(collation_),
+               ", limit=",
+               std::to_string(limit_),
+               ", offset",
+               std::to_string(offset_),
+               ", inputs=",
+               ::toString(inputs_),
+               ")");
   }
 
   size_t size() const override { return inputs_[0]->size(); }
@@ -1525,14 +1514,18 @@ class RelModify : public RelAlgNode {
   }
 
   std::string toString() const override {
-    std::ostringstream result_stream;
-    result_stream << std::boolalpha
-                  << "(RelModify<" + std::to_string(reinterpret_cast<uint64_t>(this)) +
-                         "> "
-                  << table_descriptor_->tableName << " flattened= " << flattened_
-                  << " operation= " << yieldModifyOperationString(operation_) << ")";
-
-    return result_stream.str();
+    return cat(::typeName(this),
+               "(",
+               table_descriptor_->tableName,
+               ", flattened=",
+               std::to_string(flattened_),
+               ", op=",
+               yieldModifyOperationString(operation_),
+               ", target_column_list=",
+               ::toString(target_column_list_),
+               ", inputs=",
+               ::toString(inputs_),
+               ")");
   }
 
   void applyUpdateModificationsToInputNode() {
@@ -1608,7 +1601,7 @@ class RelModify : public RelAlgNode {
 class RelTableFunction : public RelAlgNode {
  public:
   RelTableFunction(const std::string& function_name,
-                   std::shared_ptr<const RelAlgNode> input,
+                   RelAlgInputs inputs,
                    std::vector<std::string>& fields,
                    std::vector<const Rex*> col_inputs,
                    std::vector<std::unique_ptr<const RexScalar>>& table_func_inputs,
@@ -1618,7 +1611,9 @@ class RelTableFunction : public RelAlgNode {
       , col_inputs_(col_inputs)
       , table_func_inputs_(std::move(table_func_inputs))
       , target_exprs_(std::move(target_exprs)) {
-    inputs_.emplace_back(input);
+    for (const auto& input : inputs) {
+      inputs_.emplace_back(input);
+    }
   }
 
   RelTableFunction(RelTableFunction const&);
@@ -1658,21 +1653,19 @@ class RelTableFunction : public RelAlgNode {
   }
 
   std::string toString() const override {
-    std::string result = "RelTableFunction<" +
-                         std::to_string(reinterpret_cast<uint64_t>(this)) + ">(" +
-                         function_name_ + " ";
-
-    result += "targets: " + std::to_string(target_exprs_.size());
-    result += "inputs: [";
-    for (size_t i = 0; i < target_exprs_.size(); ++i) {
-      result += target_exprs_[i]->toString();
-      if (i < target_exprs_.size() - 1) {
-        result += ", ";
-      }
-    }
-    result += "])";
-
-    return result;
+    return cat(::typeName(this),
+               "(",
+               function_name_,
+               ", inputs=",
+               ::toString(inputs_),
+               ", fields=",
+               ::toString(fields_),
+               ", col_inputs=...",
+               ", table_func_inputs=",
+               ::toString(table_func_inputs_),
+               ", target_exprs=",
+               ::toString(target_exprs_),
+               ")");
   }
 
  private:
@@ -1702,13 +1695,12 @@ class RelLogicalValues : public RelAlgNode {
   const std::vector<TargetMetaInfo> getTupleType() const { return tuple_type_; }
 
   std::string toString() const override {
-    std::string ret =
-        "(RelLogicalValues<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">";
+    std::string ret = ::typeName(this) + "(";
     for (const auto& target_meta_info : tuple_type_) {
       ret += " (" + target_meta_info.get_resname() + " " +
              target_meta_info.get_type_info().get_type_name() + ")";
     }
-    ret += " )";
+    ret += ")";
     return ret;
   }
 

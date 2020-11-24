@@ -1,5 +1,25 @@
-# fixme: this should be 3.3, but that breaks static ncurses
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.16)
+
+# Required for LLVM / JIT, alternative to setting CMP0065 to OLD
+set(CMAKE_ENABLE_EXPORTS True)
+
+set(ENABLE_CONDA OFF)
+if(DEFINED ENV{CONDA_PREFIX})
+  set(ENABLE_CONDA ON)
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+  # resolves link issue for zlib 
+  link_directories("$ENV{CONDA_PREFIX}/lib")
+  # various fixes and workarounds
+  add_definitions("-Dsecure_getenv=getenv")
+  # fixes `undefined reference to `boost::system::detail::system_category_instance'`:
+  add_definitions("-DBOOST_ERROR_CODE_HEADER_ONLY")
+  # Adding formating macros
+  add_definitions("-D__STDC_FORMAT_MACROS=1")
+  # fixes always_inline attribute errors
+  add_compile_options("-fno-semantic-interposition")
+  # Adding `--sysroot=...` resolves `no member named 'signbit' in the global namespace` error:
+  set(CMAKE_SYSROOT "$ENV{CONDA_BUILD_SYSROOT}")
+endif(DEFINED ENV{CONDA_PREFIX})
 
 # force `Release` build type if left unspecified
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -37,12 +57,11 @@ add_definitions("-DMAPD_EDITION_${MAPD_EDITION}")
 string(TOLOWER "${MAPD_EDITION}" MAPD_EDITION_LOWER)
 
 set(MAPD_VERSION_MAJOR "5")
-set(MAPD_VERSION_MINOR "4")
+set(MAPD_VERSION_MINOR "5")
 set(MAPD_VERSION_PATCH "0")
 set(MAPD_VERSION_EXTRA "dev")
 set(MAPD_VERSION_RAW "${MAPD_VERSION_MAJOR}.${MAPD_VERSION_MINOR}.${MAPD_VERSION_PATCH}${MAPD_VERSION_EXTRA}")
 set(MAPD_IMMERSE_URL "http://builds.mapd.com/frontend/mapd2-dashboard-v2-137-release-prod.zip")
-set(MAPD_DOCS_URL "http://docs.builds.mapd.com/master/docs-master.zip")
 string(TIMESTAMP MAPD_BUILD_DATE "%Y%m%d")
 
 if($ENV{BUILD_NUMBER})
@@ -67,6 +86,7 @@ add_custom_target(clean-all
 option(PREFER_STATIC_LIBS "Prefer linking against static libraries" OFF)
 if(PREFER_STATIC_LIBS)
   set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+  set(Arrow_USE_STATIC_LIBS ON)
   set(Boost_USE_STATIC_LIBS ON)
   set(OPENSSL_USE_STATIC_LIBS ON)
   set(Thrift_USE_STATIC_LIBS ON)
@@ -148,13 +168,23 @@ if (ENABLE_GEOS)
 endif()
 
 # fixme: hack works for Homebrew, might not work for Conda
-if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+if(ENABLE_CONDA)
+  set(OPENSSL_ROOT_DIR "$ENV{CONDA_PREFIX}")
+elseif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin" )
   set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl/")
 endif()
+
 find_package(OpenSSL REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
 
-find_package(Thrift REQUIRED)
+if(MSVC)
+  find_package(Thrift CONFIG REQUIRED)
+  set(Thrift_INCLUDE_DIRS ${THRIFT_INCLUDE_DIR})
+  set(Thrift_EXECUTABLE "${THRIFT_BIN_DIR}/thrift.exe")
+  set(Thrift_LIBRARIES ${THRIFT_LIBRARIES})
+else()
+  find_package(Thrift REQUIRED)
+endif()
 include_directories(${Thrift_INCLUDE_DIRS})
 if("${Thrift_VERSION}" VERSION_LESS "0.11.0")
   add_definitions("-DHAVE_THRIFT_BOOST_SHAREDPTR")
@@ -189,20 +219,28 @@ if(ENABLE_FOLLY)
   endif()
 endif()
 
-find_package(Curses REQUIRED)
-include_directories(${CURSES_INCLUDE_DIRS})
-if (CURSES_HAVE_NCURSES_CURSES_H AND NOT CURSES_HAVE_CURSES_H)
-  include_directories(${CURSES_INCLUDE_DIRS}/ncurses/)
+if(MSVC)
+  include_directories(include_directories("${LIBS_PATH}/include/pdcurses"))
+else()
+  find_package(Curses)
+  include_directories(${CURSES_INCLUDE_DIRS})
+  if (CURSES_HAVE_NCURSES_CURSES_H AND NOT CURSES_HAVE_CURSES_H)
+    include_directories(${CURSES_INCLUDE_DIRS}/ncurses/)
+  endif()
 endif()
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR}/bin)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-register")
-endif()
-if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+if(MSVC)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /permissive- /EHsc /std:c++17 /D NOMINMAX /D WIN32_LEAN_AND_MEAN")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-register")
+  endif()
+  if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+  endif()
 endif()
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
@@ -219,6 +257,7 @@ if(ENABLE_ASAN)
   set(SAN_FLAGS "-fsanitize=address -O1 -fno-omit-frame-pointer")
   add_definitions("-DWITH_DECODERS_BOUNDS_CHECKING")
 elseif(ENABLE_TSAN)
+  add_definitions("-DHAVE_TSAN")
   # Copy the config directory to the build dir for TSAN suppressions
   file(COPY config DESTINATION ${CMAKE_BINARY_DIR})
 
@@ -269,24 +308,75 @@ include_directories(${CMAKE_SOURCE_DIR}
 ## Dependencies
 
 # LLVM
-set(llvm_config_cmd llvm-config)
+if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+  list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/llvm")
+endif()
+find_package(LLVM CONFIG REQUIRED)
 
-execute_process(COMMAND ${llvm_config_cmd} "--includedir" OUTPUT_VARIABLE LLVM_INC_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} "--libs" OUTPUT_VARIABLE LLVM_LIB_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} "--ldflags" OUTPUT_VARIABLE LLVM_LD_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} "--version" OUTPUT_VARIABLE LLVM_VERSION_STR)
-string(REGEX MATCH "^([0-9]+)" LLVM_VERSION_MAJOR ${LLVM_VERSION_STR})
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS} ${CURSES_LIBRARIES}")
-string(STRIP "${LLVM_LINKER_FLAGS}" LLVM_LINKER_FLAGS)
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
 
-include_directories(${LLVM_INC_FLAGS})
+find_library(CLANG_LIB clang-cpp)
+find_library(LLVM_LIB LLVM)
+# Deps builds use separate libs for each clang component, while some distros now bundle into a single lib
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" OR NOT LLVM_LIB)
+  set(LLVM_COMPONENTS support mcjit core irreader option)
+
+  option(ENABLE_INTEL_JIT_LISTENER "Enable Intel Vtune JIT Listener" OFF)
+  if(ENABLE_INTEL_JIT_LISTENER)
+    list(APPEND LLVM_COMPONENTS inteljitevents)
+  endif()
+
+  llvm_map_components_to_libnames(llvm_libs ${LLVM_TARGETS_TO_BUILD} ${LLVM_COMPONENTS})
+  set(clang_libs
+      clangFrontend
+      clangSerialization
+      clangDriver
+      clangTooling
+      clangParse
+      clangSema
+      clangAnalysis
+      clangEdit
+      clangAST
+      clangLex
+      clangBasic
+      clangRewrite
+      clangRewriteFrontend)
+
+  # LLVMSupport explicitly lists tinfo in its INTERFACE_LINK_LIBRARIES, even
+  # though we provide it in our build of ncurses. Since LLVMSupport is listed
+  # as a requirement for other llvm libs, we need to walk through the entire
+  # list in order to remove all instances of tinfo.
+  foreach(lib ${llvm_libs})
+    get_target_property(interface_libs ${lib} INTERFACE_LINK_LIBRARIES)
+    list(REMOVE_ITEM interface_libs tinfo z rt pthread -lpthread m dl)
+    set_target_properties(${lib} PROPERTIES INTERFACE_LINK_LIBRARIES "${interface_libs}")
+  endforeach()
+
+  list(APPEND llvm_libs ${CURSES_NCURSES_LIBRARY})
+else()
+  if(NOT CLANG_LIB)
+    message(FATAL_ERROR "Could not find CLANG library.")
+  endif()
+
+  set(clang_libs ${CLANG_LIB})
+  set(llvm_libs ${LLVM_LIB})
+endif()
+
+# Clang (UDF Compiler)
+find_package(Clang REQUIRED)
+include_directories(${CLANG_INCLUDE_DIRS})
+add_definitions(${CLANG_DEFINITIONS})
+
 
 # Boost
 find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale iostreams REQUIRED)
 include_directories(${Boost_INCLUDE_DIR})
 
-# CUDA architecture flags 
+# CUDA architecture flags
 set (CUDA_COMPILATION_ARCH
   -gencode=arch=compute_35,code=compute_35
   -gencode=arch=compute_50,code=compute_50
@@ -307,6 +397,9 @@ add_subdirectory(ThirdParty/googletest)
 
 # Google Benchmark
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Suppressing benchmark's tests" FORCE)
+if(WIN32)
+  set(HAVE_POSIX_REGEX 0)
+endif()
 add_subdirectory(ThirdParty/googlebenchmark)
 
 # Arrow
@@ -397,14 +490,7 @@ if(TBB_FOUND)
   list(APPEND TBB_LIBS ${TBB_LIBRARIES})
 endif()
 
-add_custom_command(
-  DEPENDS
-    ${CMAKE_SOURCE_DIR}/omnisci.thrift
-    ${CMAKE_SOURCE_DIR}/common.thrift
-    ${CMAKE_SOURCE_DIR}/completion_hints.thrift
-    ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
-    ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
-  OUTPUT
+set(gen_cpp_files
     ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
     ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
@@ -417,24 +503,23 @@ add_custom_command(
     ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_constants.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.h
+)
+add_custom_command(
+  DEPENDS
+    ${CMAKE_SOURCE_DIR}/omnisci.thrift
+    ${CMAKE_SOURCE_DIR}/common.thrift
+    ${CMAKE_SOURCE_DIR}/completion_hints.thrift
+    ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
+    ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
+  OUTPUT ${gen_cpp_files}
   COMMAND ${Thrift_EXECUTABLE}
   ARGS -gen cpp -r -o ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/omnisci.thrift)
 list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/gen-cpp/)
 
-add_library(mapd_thrift
-  ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
-  ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_types.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_constants.cpp
-  ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
-)
+add_custom_target(thrift_gen DEPENDS ${gen_cpp_files})
+
+add_library(mapd_thrift ${gen_cpp_files})
 
 target_compile_options(mapd_thrift PRIVATE -fPIC)
 target_link_libraries(mapd_thrift ${Thrift_LIBRARIES})
@@ -511,15 +596,17 @@ add_subdirectory(QueryEngine)
 add_subdirectory(DataMgr)
 add_subdirectory(CudaMgr)
 add_subdirectory(LockMgr)
+add_subdirectory(Logger)
 add_subdirectory(MigrationMgr)
 add_subdirectory(Fragmenter)
 add_subdirectory(Shared)
+add_subdirectory(OSDependent)
 add_subdirectory(Utils)
 add_subdirectory(QueryRunner)
 add_subdirectory(SQLFrontend)
 add_subdirectory(TableArchiver)
 add_subdirectory(ThriftHandler)
-
+add_subdirectory(Geospatial)
 add_subdirectory(Distributed)
 
 if(ENABLE_DBE)
@@ -531,7 +618,7 @@ if(ENABLE_ODBC)
   add_subdirectory(ODBC)
 endif()
 
-set(MAPD_LIBRARIES Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer ImportExport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter)
+set(MAPD_LIBRARIES OSDependent Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer ImportExport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter Logger Geospatial)
 
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   list(APPEND MAPD_LIBRARIES Distributed)
@@ -566,7 +653,7 @@ if (ENABLE_TESTS)
   add_subdirectory(SampleCode)
 endif()
 
-if(ENABLE_RENDERING AND (ENABLE_TESTS OR ENABLE_RENDER_TESTS))
+if(ENABLE_RENDERING AND ENABLE_RENDER_TESTS)
   enable_testing()
   add_subdirectory(Tests/RenderTests)
 endif()
@@ -584,8 +671,7 @@ add_custom_command(
     OUTPUT
         ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/OmniSci.java
         ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/TRow.java
-    COMMAND mkdir
-    ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
     ARGS -gen java -r -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/omnisci.thrift)
 
@@ -593,8 +679,7 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/common.thrift
     OUTPUT
         ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/common.java
-    COMMAND mkdir
-    ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
     ARGS -gen java -r -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/common.thrift)
 
@@ -602,16 +687,14 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
     OUTPUT
         ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/server/serialized_result_set.java
-    COMMAND mkdir
-    ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
     ARGS -gen java -r -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift)
 
 add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/java/thrift/calciteserver.thrift ${CMAKE_SOURCE_DIR}/completion_hints.thrift ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
     OUTPUT ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/com/omnisci/thrift/calciteserver/CalciteServer.java
-    COMMAND mkdir
-    ARGS -p ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/java/thrift/src/gen
     COMMAND ${Thrift_EXECUTABLE}
     ARGS -gen java -r -I ${CMAKE_SOURCE_DIR} -out ${CMAKE_SOURCE_DIR}/java/thrift/src/gen/ ${CMAKE_SOURCE_DIR}/java/thrift/calciteserver.thrift)
 
@@ -661,14 +744,14 @@ endmacro()
 find_program(JQ_EXECUTABLE NAMES jq)
 if (NOT ${JQ_EXECUTABLE} STREQUAL "JQ_EXECUTABLE-NOTFOUND")
   file(WRITE ${CMAKE_BINARY_DIR}/jq.filter "map(select(.file | test(\".*/(build|ThirdParty)/.*\") | not))")
-  add_custom_target(clang-tidy
+  add_custom_target(run-clang-tidy
     COMMAND mkdir -p clang-tidy
     COMMAND ${JQ_EXECUTABLE} -f jq.filter ${CMAKE_BINARY_DIR}/compile_commands.json > clang-tidy/compile_commands.json
     COMMAND cd clang-tidy && ${CMAKE_SOURCE_DIR}/ThirdParty/clang/run-clang-tidy.py -quiet -format -fix -header-filter="${CMAKE_SOURCE_DIR}/.*" 2> /dev/null
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   )
 else()
-  message(STATUS "jq not found, disabling clang-tidy target")
+  message(STATUS "jq not found, disabling run-clang-tidy target")
 endif()
 
 # doxygen
@@ -703,10 +786,10 @@ endif()
 
 set_dpkg_arch(${CMAKE_SYSTEM_PROCESSOR} CPACK_DEBIAN_PACKAGE_ARCHITECTURE)
 
-install(DIRECTORY ThirdParty/licenses DESTINATION "ThirdParty/")
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/licenses" DESTINATION "ThirdParty" COMPONENT "doc")
 
 # OmniSciTypes.h local includes (for UDF/UDTF)
-install(FILES Shared/funcannotations.h DESTINATION "Shared/")
+install(FILES Shared/funcannotations.h DESTINATION "Shared/" COMPONENT "include")
 
 # Frontend
 option(MAPD_IMMERSE_DOWNLOAD "Download OmniSci Immerse for packaging" OFF)
@@ -723,6 +806,7 @@ if(MAPD_IMMERSE_DOWNLOAD)
     LOG_DOWNLOAD on
     )
   externalproject_get_property(frontend source_dir)
+
   install(DIRECTORY ${source_dir}/ DESTINATION "frontend/" PATTERN .git EXCLUDE PATTERN node_modules EXCLUDE)
   add_custom_command(TARGET frontend COMMAND ${CMAKE_COMMAND} -E copy_directory ${source_dir} frontend)
   list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/frontend)
@@ -734,27 +818,6 @@ if(MAPD_IMMERSE_DOWNLOAD)
 endif()
 
 add_subdirectory(ThirdParty/generate_cert)
-
-# docs
-option(MAPD_DOCS_DOWNLOAD "Download OmniSci documentation for packaging" OFF)
-set(MAPD_DOCS_URL ${MAPD_DOCS_URL} CACHE STRING "URL to bundled docs")
-if(MAPD_DOCS_DOWNLOAD)
-  include(ExternalProject)
-  externalproject_add(docs
-    URL ${MAPD_DOCS_URL}
-    PREFIX external
-    CONFIGURE_COMMAND ""
-    UPDATE_COMMAND ""
-    BUILD_COMMAND ""
-    INSTALL_COMMAND ""
-    LOG_DOWNLOAD on
-    )
-  externalproject_get_property(docs source_dir)
-  install(DIRECTORY ${source_dir}/ DESTINATION "docs/" PATTERN .git EXCLUDE)
-  add_custom_command(TARGET docs COMMAND ${CMAKE_COMMAND} -E copy_directory ${source_dir} docs)
-  list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/docs)
-endif()
-
 
 # systemd
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
@@ -782,12 +845,19 @@ endif()
 
 set (OMNISCI_JDBC_JAR "omnisci-jdbc-${OMNISCI_JAR_RELEASE_VERSION}.jar")
 
+set(MVN_PATH_COMMAND "")
+if(MSVC) 
+    set(MVN_PATH_COMMAND set "MVNPATH=${CMAKE_SOURCE_DIR}/java" &&)
+else()
+    set(MVN_PATH_COMMAND "MVNPATH=${CMAKE_SOURCE_DIR}/java")
+endif()
+
 add_custom_command(
   OUTPUT
     ${CMAKE_BINARY_DIR}/bin/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar
     ${CMAKE_BINARY_DIR}/bin/${OMNISCI_JDBC_JAR}
     ${CMAKE_BINARY_DIR}/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar
-    COMMAND MVNPATH=${CMAKE_SOURCE_DIR}/java ${MVN_EXECUTABLE} -q clean install -Dthrift.version="${Thrift_VERSION}" -Domnisci.release.version="${OMNISCI_JAR_RELEASE_VERSION}"
+    COMMAND ${MVN_PATH_COMMAND} ${MVN_EXECUTABLE} -q clean install -Dthrift.version="${Thrift_VERSION}" -Domnisci.release.version="${OMNISCI_JAR_RELEASE_VERSION}"
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/mapd/target/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar ${CMAKE_BINARY_DIR}/bin
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/omniscijdbc/target/${OMNISCI_JDBC_JAR} ${CMAKE_BINARY_DIR}/bin
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/calcite/target/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar ${CMAKE_BINARY_DIR}/bin
@@ -805,27 +875,32 @@ add_custom_target(mapd_java_components ALL DEPENDS
   ${CMAKE_BINARY_DIR}/bin/${OMNISCI_JDBC_JAR}
   ${CMAKE_BINARY_DIR}/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar)
 add_custom_target(mapd_java_clean
-  COMMAND MVNPATH=${CMAKE_SOURCE_DIR}/java ${MVN_EXECUTABLE} -q clean -Domnisci.release.version="${OMNISCI_JAR_RELEASE_VERSION}"
+  COMMAND ${MVN_PATH_COMMAND} ${MVN_EXECUTABLE} -q clean -Domnisci.release.version="${OMNISCI_JAR_RELEASE_VERSION}"
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/java
   )
 add_dependencies(clean-all mapd_java_clean)
-install(FILES ${CMAKE_SOURCE_DIR}/java/mapd/target/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar DESTINATION bin)
-install(FILES ${CMAKE_SOURCE_DIR}/java/omniscijdbc/target/${OMNISCI_JDBC_JAR} DESTINATION bin)
-install(FILES ${CMAKE_SOURCE_DIR}/java/calcite/target/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar DESTINATION bin)
+install(FILES ${CMAKE_SOURCE_DIR}/java/mapd/target/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar DESTINATION bin COMPONENT "jar")
+install(FILES ${CMAKE_SOURCE_DIR}/java/omniscijdbc/target/${OMNISCI_JDBC_JAR} DESTINATION bin COMPONENT "jar")
+install(FILES ${CMAKE_SOURCE_DIR}/java/calcite/target/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar DESTINATION bin COMPONENT "jar")
+
+add_custom_target(maven_populate_cache
+  COMMAND ${MVN_PATH_COMMAND} ${MVN_EXECUTABLE} -q verify -Domnisci.release.version="${OMNISCI_JAR_RELEASE_VERSION}"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/java
+  )
 
 set_directory_properties(PROPERTIES ADDITIONAL_MAKE_CLEAN_FILES "${ADDITIONAL_MAKE_CLEAN_FILES}")
 
-install(TARGETS initdb omnisci_server DESTINATION bin)
-install(FILES ${CMAKE_BINARY_DIR}/MAPD_GIT_HASH.txt DESTINATION ".")
+install(TARGETS initdb omnisci_server DESTINATION bin COMPONENT "exe")
+install(FILES ${CMAKE_BINARY_DIR}/MAPD_GIT_HASH.txt DESTINATION "." COMPONENT "doc")
 if(ENABLE_CUDA)
-  install(FILES ${CMAKE_BINARY_DIR}/QueryEngine/cuda_mapd_rt.fatbin DESTINATION QueryEngine)
+  install(FILES ${CMAKE_BINARY_DIR}/QueryEngine/cuda_mapd_rt.fatbin DESTINATION QueryEngine COMPONENT "exe")
 endif()
-install(FILES completion_hints.thrift DESTINATION ".")
-install(FILES omnisci.thrift DESTINATION ".")
-install(FILES common.thrift DESTINATION ".")
-install(FILES QueryEngine/serialized_result_set.thrift DESTINATION "QueryEngine/")
+install(FILES completion_hints.thrift DESTINATION "." COMPONENT "thrift")
+install(FILES omnisci.thrift DESTINATION "." COMPONENT "thrift")
+install(FILES common.thrift DESTINATION "." COMPONENT "thrift")
+install(FILES QueryEngine/serialized_result_set.thrift DESTINATION "QueryEngine/" COMPONENT "thrift")
 
-if(NOT PREFER_STATIC_LIBS)
+if(NOT PREFER_STATIC_LIBS AND NOT ENABLE_CONDA)
   install(FILES ${Boost_LIBRARIES} DESTINATION ThirdParty/lib)
 endif()
 
@@ -836,11 +911,11 @@ else()
 endif()
 
 if("${MAPD_EDITION_LOWER}" STREQUAL "os")
-  install(FILES LICENSE.md DESTINATION ".")
+  install(FILES LICENSE.md DESTINATION "." COMPONENT "doc")
 endif()
 
 set(CPACK_RESOURCE_FILE_LICENSE "${EULA_FILE}")
-install(FILES "${EULA_FILE}" DESTINATION ".")
+install(FILES "${EULA_FILE}" DESTINATION "."  COMPONENT "doc")
 
 install(PROGRAMS startomnisci DESTINATION ".")
 install(PROGRAMS scripts/inneromnisci DESTINATION "scripts")

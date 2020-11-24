@@ -23,8 +23,8 @@
 #include "../Parser/ParserNode.h"
 #include "../Shared/checked_alloc.h"
 #include "GroupByAndAggregate.h"
+#include "Logger/Logger.h"
 #include "RuntimeFunctions.h"
-#include "Shared/Logger.h"
 
 #include <boost/multiprecision/cpp_int.hpp>
 #include <limits>
@@ -128,6 +128,7 @@ InValuesBitmap::~InValuesBitmap() {
 }
 
 llvm::Value* InValuesBitmap::codegen(llvm::Value* needle, Executor* executor) const {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   std::vector<std::shared_ptr<const Analyzer::Constant>> constants_owned;
   std::vector<const Analyzer::Constant*> constants;
   for (const auto bitset : bitsets_) {

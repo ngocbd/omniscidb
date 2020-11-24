@@ -26,10 +26,10 @@
 #include "Catalog/SysCatalog.h"
 #include "Catalog/TableDescriptor.h"
 #include "LeafAggregator.h"
-#include "QueryEngine/BaselineJoinHashTable.h"
 #include "QueryEngine/CompilationOptions.h"
-#include "QueryEngine/JoinHashTable.h"
-#include "QueryEngine/OverlapsJoinHashTable.h"
+#include "QueryEngine/JoinHashTable/BaselineJoinHashTable.h"
+#include "QueryEngine/JoinHashTable/JoinHashTable.h"
+#include "QueryEngine/JoinHashTable/OverlapsJoinHashTable.h"
 #include "QueryEngine/QueryDispatchQueue.h"
 #include "QueryEngine/QueryHint.h"
 #include "ThriftHandler/QueryState.h"
@@ -139,7 +139,8 @@ class QueryRunner {
       std::shared_ptr<Executor> executor,
       const std::string& session_id,
       const ExecutorDeviceType device_type,
-      const unsigned interrupt_check_freq = 1000);
+      const double running_query_check_freq = 0.9,
+      const unsigned pending_query_check_freq = 1000);
   virtual std::vector<std::shared_ptr<ResultSet>> runMultipleStatements(
       const std::string&,
       const ExecutorDeviceType);
@@ -150,7 +151,7 @@ class QueryRunner {
       const TableDescriptor* td) const;
 
   const std::shared_ptr<std::vector<int32_t>>& getCachedJoinHashTable(size_t idx);
-  const std::shared_ptr<std::vector<int8_t>>& getCachedBaselineHashTable(size_t idx);
+  const int8_t* getCachedBaselineHashTable(size_t idx);
   size_t getEntryCntCachedBaselineHashTable(size_t idx);
   uint64_t getNumberOfCachedJoinHashTables();
   uint64_t getNumberOfCachedBaselineJoinHashTables();

@@ -22,12 +22,12 @@
 #include "OutputBufferInitialization.h"
 #include "QueryTemplateGenerator.h"
 
+#include "OSDependent/omnisci_path.h"
 #include "Shared/MathUtils.h"
-#include "Shared/mapdpath.h"
 #include "StreamingTopN.h"
 
-#if LLVM_VERSION_MAJOR < 4
-static_assert(false, "LLVM Version >= 4 is required.");
+#if LLVM_VERSION_MAJOR < 9
+static_assert(false, "LLVM Version >= 9 is required.");
 #endif
 
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -36,9 +36,12 @@ static_assert(false, "LLVM Version >= 4 is required.");
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/GlobalValue.h>
 #include <llvm/IR/InstIterator.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormattedStream.h>
@@ -47,25 +50,21 @@ static_assert(false, "LLVM Version >= 4 is required.");
 #include <llvm/Support/TargetRegistry.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_os_ostream.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Instrumentation.h>
 #include <llvm/Transforms/Scalar.h>
-#include <llvm/Transforms/Utils/BasicBlockUtils.h>
-#include <llvm/Transforms/Utils/Cloning.h>
-#include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Intrinsics.h"
-
-#if LLVM_VERSION_MAJOR >= 7
 #include <llvm/Transforms/Scalar/InstSimplifyPass.h>
 #include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+
+#if LLVM_VERSION_MAJOR >= 11
+#include <llvm/Support/Host.h>
 #endif
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/Linker/Linker.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/raw_ostream.h>
 
 float g_fraction_code_cache_to_evict = 0.2;
 
@@ -75,6 +74,10 @@ std::unique_ptr<llvm::Module> rt_udf_gpu_module;
 std::unique_ptr<llvm::Module> rt_udf_cpu_module;
 
 extern std::unique_ptr<llvm::Module> g_rt_module;
+
+#ifdef HAVE_CUDA
+extern std::unique_ptr<llvm::Module> g_rt_libdevice_module;
+#endif
 
 #ifdef ENABLE_GEOS
 extern std::unique_ptr<llvm::Module> g_rt_geos_module;
@@ -118,6 +121,38 @@ void load_geos_dynamic_library() {
 
 namespace {
 
+/* SHOW_DEFINED(<llvm::Module instance>) prints the function names
+   that are defined in the given LLVM Module instance. Useful for
+   debugging.
+*/
+
+#define SHOW_DEFINED(MODULE)                                         \
+  {                                                                  \
+    std::cout << __func__ << "#" << __LINE__ << ": " #MODULE << " "; \
+    ::show_defined(MODULE);                                          \
+  }
+
+template <typename T = void>
+void show_defined(llvm::Module& module) {
+  std::cout << "defines: ";
+  for (auto& f : module.getFunctionList()) {
+    if (!f.isDeclaration()) {
+      std::cout << f.getName().str() << ", ";
+    }
+  }
+  std::cout << std::endl;
+}
+
+template <typename T = void>
+void show_defined(llvm::Module* module) {
+  show_defined(*module);
+}
+
+template <typename T = void>
+void show_defined(std::unique_ptr<llvm::Module>& module) {
+  show_defined(module.get());
+}
+
 #if defined(HAVE_CUDA) || !defined(WITH_JIT_DEBUG)
 void eliminate_dead_self_recursive_funcs(
     llvm::Module& M,
@@ -144,6 +179,42 @@ void eliminate_dead_self_recursive_funcs(
   }
 }
 
+#ifdef HAVE_CUDA
+
+// check if linking with libdevice is required
+// libdevice functions have a __nv_* prefix
+bool check_module_requires_libdevice(llvm::Module* module) {
+  for (llvm::Function& F : *module) {
+    if (F.hasName() && F.getName().startswith("__nv_")) {
+      LOG(INFO) << "Module requires linking with libdevice: " << std::string(F.getName());
+      return true;
+    }
+  }
+  LOG(INFO) << "module does not require linking against libdevice";
+  return false;
+}
+
+// Adds the missing intrinsics declarations to the given module
+void add_intrinsics_to_module(llvm::Module* module) {
+  for (llvm::Function& F : *module) {
+    for (llvm::Instruction& I : instructions(F)) {
+      if (llvm::IntrinsicInst* ii = llvm::dyn_cast<llvm::IntrinsicInst>(&I)) {
+        if (llvm::Intrinsic::isOverloaded(ii->getIntrinsicID())) {
+          llvm::Type* Tys[] = {ii->getFunctionType()->getReturnType()};
+          llvm::Function& decl_fn =
+              *llvm::Intrinsic::getDeclaration(module, ii->getIntrinsicID(), Tys);
+          ii->setCalledFunction(&decl_fn);
+        } else {
+          // inserts the declaration into the module if not present
+          llvm::Intrinsic::getDeclaration(module, ii->getIntrinsicID());
+        }
+      }
+    }
+  }
+}
+
+#endif
+
 void optimize_ir(llvm::Function* query_func,
                  llvm::Module* module,
                  llvm::legacy::PassManager& pass_manager,
@@ -151,11 +222,7 @@ void optimize_ir(llvm::Function* query_func,
                  const CompilationOptions& co) {
   pass_manager.add(llvm::createAlwaysInlinerLegacyPass());
   pass_manager.add(llvm::createPromoteMemoryToRegisterPass());
-#if LLVM_VERSION_MAJOR >= 7
   pass_manager.add(llvm::createInstSimplifyLegacyPass());
-#else
-  pass_manager.add(llvm::createInstructionSimplifierPass());
-#endif
   pass_manager.add(llvm::createInstructionCombiningPass());
   pass_manager.add(llvm::createGlobalOptimizerPass());
 
@@ -181,10 +248,15 @@ ExecutionEngineWrapper::ExecutionEngineWrapper(llvm::ExecutionEngine* execution_
     : execution_engine_(execution_engine) {
   if (execution_engine_) {
     if (co.register_intel_jit_listener) {
+#ifdef ENABLE_INTEL_JIT_LISTENER
       intel_jit_listener_.reset(llvm::JITEventListener::createIntelJITEventListener());
       CHECK(intel_jit_listener_);
       execution_engine_->RegisterJITEventListener(intel_jit_listener_.get());
       LOG(INFO) << "Registered IntelJITEventListener";
+#else
+      LOG(WARNING) << "This build is not Intel JIT Listener enabled. Ignoring Intel JIT "
+                      "listener configuration parameter.";
+#endif  // ENABLE_INTEL_JIT_LISTENER
     }
   }
 }
@@ -199,8 +271,11 @@ ExecutionEngineWrapper& ExecutionEngineWrapper::operator=(
 void verify_function_ir(const llvm::Function* func) {
   std::stringstream err_ss;
   llvm::raw_os_ostream err_os(err_ss);
+  err_os << "\n-----\n";
   if (llvm::verifyFunction(*func, &err_os)) {
-    func->print(llvm::outs());
+    err_os << "\n-----\n";
+    func->print(err_os, nullptr);
+    err_os << "\n-----\n";
     LOG(FATAL) << err_ss.str();
   }
 }
@@ -224,6 +299,28 @@ void Executor::addCodeToCache(const CodeCacheKey& key,
             std::make_pair<std::shared_ptr<CompilationContext>, decltype(module)>(
                 std::move(compilation_context), std::move(module)));
 }
+
+namespace {
+
+std::string assemblyForCPU(ExecutionEngineWrapper& execution_engine,
+                           llvm::Module* module) {
+  llvm::legacy::PassManager pass_manager;
+  auto cpu_target_machine = execution_engine->getTargetMachine();
+  CHECK(cpu_target_machine);
+  llvm::SmallString<256> code_str;
+  llvm::raw_svector_ostream os(code_str);
+#if LLVM_VERSION_MAJOR >= 10
+  cpu_target_machine->addPassesToEmitFile(
+      pass_manager, os, nullptr, llvm::CGFT_AssemblyFile);
+#else
+  cpu_target_machine->addPassesToEmitFile(
+      pass_manager, os, nullptr, llvm::TargetMachine::CGFT_AssemblyFile);
+#endif
+  pass_manager.run(*module);
+  return "Assembly for the CPU:\n" + std::string(code_str.str()) + "\nEnd of assembly";
+}
+
+}  // namespace
 
 ExecutionEngineWrapper CodeGenerator::generateNativeCPUCode(
     llvm::Function* func,
@@ -257,6 +354,7 @@ ExecutionEngineWrapper CodeGenerator::generateNativeCPUCode(
 
   ExecutionEngineWrapper execution_engine(eb.create(), co);
   CHECK(execution_engine.get());
+  LOG(ASM) << assemblyForCPU(execution_engine, module);
 
   execution_engine->finalizeObject();
 
@@ -271,6 +369,9 @@ std::shared_ptr<CompilationContext> Executor::optimizeAndCodegenCPU(
   auto module = multifrag_query_func->getParent();
   CodeCacheKey key{serialize_llvm_object(query_func),
                    serialize_llvm_object(cgen_state_->row_func_)};
+  if (cgen_state_->filter_func_) {
+    key.push_back(serialize_llvm_object(cgen_state_->filter_func_));
+  }
   for (const auto helper : cgen_state_->helper_functions_) {
     key.push_back(serialize_llvm_object(helper));
   }
@@ -285,13 +386,7 @@ std::shared_ptr<CompilationContext> Executor::optimizeAndCodegenCPU(
 
     // Read geos runtime module and bind GEOS API function references to GEOS library
     auto rt_geos_module_copy = llvm::CloneModule(
-#if LLVM_VERSION_MAJOR >= 7
-        *g_rt_geos_module.get(),
-#else
-        g_rt_geos_module.get(),
-#endif
-        cgen_state_->vmap_,
-        [](const llvm::GlobalValue* gv) {
+        *g_rt_geos_module.get(), cgen_state_->vmap_, [](const llvm::GlobalValue* gv) {
           auto func = llvm::dyn_cast<llvm::Function>(gv);
           if (!func) {
             return true;
@@ -343,13 +438,7 @@ void CodeGenerator::link_udf_module(const std::unique_ptr<llvm::Module>& udf_mod
 
   std::unique_ptr<llvm::Module> udf_module_copy;
 
-  udf_module_copy = llvm::CloneModule(
-#if LLVM_VERSION_MAJOR >= 7
-      *udf_module.get(),
-#else
-      udf_module.get(),
-#endif
-      cgen_state->vmap_);
+  udf_module_copy = llvm::CloneModule(*udf_module.get(), cgen_state->vmap_);
 
   udf_module_copy->setDataLayout(module.getDataLayout());
   udf_module_copy->setTargetTriple(module.getTargetTriple());
@@ -502,6 +591,19 @@ declare i1 @slotEmptyKeyCAS(i64*, i64, i64);
 declare i1 @slotEmptyKeyCAS_int32(i32*, i32, i32);
 declare i1 @slotEmptyKeyCAS_int16(i16*, i16, i16);
 declare i1 @slotEmptyKeyCAS_int8(i8*, i8, i8);
+declare i64 @datetrunc_century(i64);
+declare i64 @datetrunc_day(i64);
+declare i64 @datetrunc_decade(i64);
+declare i64 @datetrunc_hour(i64);
+declare i64 @datetrunc_millennium(i64);
+declare i64 @datetrunc_minute(i64);
+declare i64 @datetrunc_month(i64);
+declare i64 @datetrunc_quarter(i64);
+declare i64 @datetrunc_quarterday(i64);
+declare i64 @datetrunc_week_monday(i64);
+declare i64 @datetrunc_week_sunday(i64);
+declare i64 @datetrunc_week_saturday(i64);
+declare i64 @datetrunc_year(i64);
 declare i64 @extract_epoch(i64);
 declare i64 @extract_dateepoch(i64);
 declare i64 @extract_quarterday(i64);
@@ -514,13 +616,13 @@ declare i64 @extract_nanosecond(i64);
 declare i64 @extract_dow(i64);
 declare i64 @extract_isodow(i64);
 declare i64 @extract_day(i64);
-declare i64 @extract_week(i64);
-declare i64 @extract_day_of_week(i64);
+declare i64 @extract_week_monday(i64);
+declare i64 @extract_week_sunday(i64);
+declare i64 @extract_week_saturday(i64);
+declare i64 @extract_day_of_year(i64);
 declare i64 @extract_month(i64);
 declare i64 @extract_quarter(i64);
 declare i64 @extract_year(i64);
-declare i64 @DateTruncate(i32, i64);
-declare i64 @DateTruncateNullable(i32, i64, i64);
 declare i64 @DateTruncateHighPrecisionToDate(i64, i64);
 declare i64 @DateTruncateHighPrecisionToDateNullable(i64, i64, i64);
 declare i64 @DateDiff(i32, i64, i64);
@@ -529,8 +631,8 @@ declare i64 @DateDiffHighPrecision(i32, i64, i64, i32, i32);
 declare i64 @DateDiffHighPrecisionNullable(i32, i64, i64, i32, i32, i64);
 declare i64 @DateAdd(i32, i64, i64);
 declare i64 @DateAddNullable(i32, i64, i64, i64);
-declare i64 @DateAddHighPrecision(i32, i64, i64, i64);
-declare i64 @DateAddHighPrecisionNullable(i32, i64, i64, i64, i64);
+declare i64 @DateAddHighPrecision(i32, i64, i64, i32);
+declare i64 @DateAddHighPrecisionNullable(i32, i64, i64, i32, i64);
 declare i64 @string_decode(i8*, i64);
 declare i32 @array_size(i8*, i64, i32);
 declare i32 @array_size_nullable(i8*, i64, i32, i32);
@@ -568,7 +670,7 @@ declare i32 @char_length_nullable(i8*, i32, i32);
 declare i32 @char_length_encoded(i8*, i32);
 declare i32 @char_length_encoded_nullable(i8*, i32, i32);
 declare i32 @key_for_string_encoded(i32);
-declare i32 @sample_ratio(double, i64);
+declare i1 @sample_ratio(double, i64);
 declare i1 @string_like(i8*, i32, i8*, i32, i8);
 declare i1 @string_ilike(i8*, i32, i8*, i32, i8);
 declare i8 @string_like_nullable(i8*, i32, i8*, i32, i8, i8);
@@ -595,7 +697,8 @@ declare void @linear_probabilistic_count(i8*, i32, i8*, i32);
 declare void @agg_count_distinct_bitmap_gpu(i64*, i64, i64, i64, i64, i64, i64);
 declare void @agg_count_distinct_bitmap_skip_val_gpu(i64*, i64, i64, i64, i64, i64, i64, i64);
 declare void @agg_approximate_count_distinct_gpu(i64*, i64, i32, i64, i64);
-declare i32 @record_error_code(i32, i32*);
+declare void @record_error_code(i32, i32*);
+declare i32 @get_error_code(i32*);
 declare i1 @dynamic_watchdog();
 declare i1 @check_interrupt();
 declare void @force_sync();
@@ -662,7 +765,7 @@ llvm::StringRef get_gpu_data_layout() {
       "v32:32:32-v64:64:64-v128:128:128-n16:32:64");
 }
 
-std::map<std::string, std::string> get_device_parameters() {
+std::map<std::string, std::string> get_device_parameters(bool cpu_only) {
   std::map<std::string, std::string> result;
 
   result.insert(std::make_pair("cpu_name", llvm::sys::getHostCPUName()));
@@ -682,25 +785,32 @@ std::map<std::string, std::string> get_device_parameters() {
   }
 
 #ifdef HAVE_CUDA
-  int device_count = 0;
-  checkCudaErrors(cuDeviceGetCount(&device_count));
-  if (device_count) {
-    CUdevice device{};
-    char device_name[256];
-    int major = 0, minor = 0;
-    checkCudaErrors(cuDeviceGet(&device, 0));  // assuming homogeneous multi-GPU system
-    checkCudaErrors(cuDeviceGetName(device_name, 256, device));
-    checkCudaErrors(cuDeviceGetAttribute(
-        &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
-    checkCudaErrors(cuDeviceGetAttribute(
-        &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+  if (!cpu_only) {
+    int device_count = 0;
+    checkCudaErrors(cuDeviceGetCount(&device_count));
+    if (device_count) {
+      CUdevice device{};
+      char device_name[256];
+      int major = 0, minor = 0;
+      int driver_version;
+      checkCudaErrors(cuDeviceGet(&device, 0));  // assuming homogeneous multi-GPU system
+      checkCudaErrors(cuDeviceGetName(device_name, 256, device));
+      checkCudaErrors(cuDeviceGetAttribute(
+          &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+      checkCudaErrors(cuDeviceGetAttribute(
+          &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+      checkCudaErrors(cuDriverGetVersion(&driver_version));
 
-    result.insert(std::make_pair("gpu_name", device_name));
-    result.insert(std::make_pair("gpu_count", std::to_string(device_count)));
-    result.insert(std::make_pair("gpu_compute_capability",
-                                 std::to_string(major) + "." + std::to_string(minor)));
-    result.insert(std::make_pair("gpu_triple", get_gpu_target_triple_string()));
-    result.insert(std::make_pair("gpu_datalayout", get_gpu_data_layout()));
+      result.insert(std::make_pair("gpu_name", device_name));
+      result.insert(std::make_pair("gpu_count", std::to_string(device_count)));
+      result.insert(std::make_pair("gpu_compute_capability",
+                                   std::to_string(major) + "." + std::to_string(minor)));
+      result.insert(std::make_pair("gpu_triple", get_gpu_target_triple_string()));
+      result.insert(std::make_pair("gpu_datalayout", get_gpu_data_layout()));
+      result.insert(std::make_pair("gpu_driver",
+                                   "CUDA " + std::to_string(driver_version / 1000) + "." +
+                                       std::to_string((driver_version % 1000) / 10)));
+    }
   }
 #endif
 
@@ -715,6 +825,27 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
     const GPUTarget& gpu_target) {
 #ifdef HAVE_CUDA
   auto module = func->getParent();
+  /*
+    `func` is one of the following generated functions:
+    - `call_table_function(i8** %input_col_buffers, i64*
+      %input_row_count, i64** %output_buffers, i64* %output_row_count)`
+      that wraps the user-defined table function.
+    - `multifrag_query`
+    - `multifrag_query_hoisted_literals`
+    - ...
+
+    `wrapper_func` is table_func_kernel(i32*, i8**, i64*, i64**,
+    i64*) that wraps `call_table_function`.
+
+    `module` is from `build/QueryEngine/RuntimeFunctions.bc` and it
+    contains `func` and `wrapper_func`.  `module` should also contain
+    the definitions of user-defined table functions.
+
+    `live_funcs` contains table_func_kernel and call_table_function
+
+    `gpu_target.cgen_state->module_` appears to be the same as `module`
+   */
+  CHECK(gpu_target.cgen_state->module_ == module);
   module->setDataLayout(
       "e-p:64:64:64-i1:8:8-i8:8:8-"
       "i16:16:16-i32:32:32-i64:64:64-"
@@ -723,14 +854,29 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
   module->setTargetTriple("nvptx64-nvidia-cuda");
   CHECK(gpu_target.nvptx_target_machine);
   auto pass_manager_builder = llvm::PassManagerBuilder();
-  // add nvvm reflect pass replacing any NVVM conditionals with constants
-  gpu_target.nvptx_target_machine->adjustPassManager(pass_manager_builder);
-  pass_manager_builder.OptLevel = 0;
 
-  llvm::legacy::PassManager pass_manager;
-  pass_manager_builder.populateModulePassManager(pass_manager);
+  pass_manager_builder.OptLevel = 0;
+  llvm::legacy::PassManager module_pass_manager;
+  pass_manager_builder.populateModulePassManager(module_pass_manager);
+
+  bool requires_libdevice = check_module_requires_libdevice(module);
+
+  if (requires_libdevice) {
+    // add nvvm reflect pass replacing any NVVM conditionals with constants
+    gpu_target.nvptx_target_machine->adjustPassManager(pass_manager_builder);
+    llvm::legacy::FunctionPassManager FPM(module);
+    pass_manager_builder.populateFunctionPassManager(FPM);
+
+    // Run the NVVMReflectPass here rather than inside optimize_ir
+    FPM.doInitialization();
+    for (auto& F : *module) {
+      FPM.run(F);
+    }
+    FPM.doFinalization();
+  }
+
   // run optimizations
-  optimize_ir(func, module, pass_manager, live_funcs, co);
+  optimize_ir(func, module, module_pass_manager, live_funcs, co);
   legalize_nvvm_ir(func);
 
   std::stringstream ss;
@@ -752,6 +898,9 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
   if (gpu_target.row_func_not_inlined) {
     clear_function_attributes(gpu_target.cgen_state->row_func_);
     roots.insert(gpu_target.cgen_state->row_func_);
+    if (gpu_target.cgen_state->filter_func_) {
+      roots.insert(gpu_target.cgen_state->filter_func_);
+    }
   }
 
   // prevent helper functions from being removed
@@ -760,7 +909,6 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
   }
 
   // Prevent the udf function(s) from being removed the way the runtime functions are
-
   std::unordered_set<std::string> udf_declarations;
   if (is_udf_module_present()) {
     for (auto& f : udf_gpu_module->getFunctionList()) {
@@ -805,6 +953,11 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
   for (auto& pFn : rt_funcs) {
     pFn->removeFromParent();
   }
+
+  if (requires_libdevice) {
+    add_intrinsics_to_module(module);
+  }
+
   module->print(os, nullptr);
   os.flush();
 
@@ -813,7 +966,7 @@ std::shared_ptr<GpuCompilationContext> CodeGenerator::generateNativeGPUCode(
   }
   module->eraseNamedMetadata(md);
 
-  auto cuda_llir = cuda_rt_decls + extension_function_decls(udf_declarations) + ss.str();
+  auto cuda_llir = ss.str() + cuda_rt_decls + extension_function_decls(udf_declarations);
   const auto ptx = generatePTX(
       cuda_llir, gpu_target.nvptx_target_machine, gpu_target.cgen_state->context_);
 
@@ -859,7 +1012,9 @@ std::shared_ptr<CompilationContext> Executor::optimizeAndCodegenGPU(
   CHECK(cuda_mgr);
   CodeCacheKey key{serialize_llvm_object(query_func),
                    serialize_llvm_object(cgen_state_->row_func_)};
-
+  if (cgen_state_->filter_func_) {
+    key.push_back(serialize_llvm_object(cgen_state_->filter_func_));
+  }
   for (const auto helper : cgen_state_->helper_functions_) {
     key.push_back(serialize_llvm_object(helper));
   }
@@ -893,6 +1048,27 @@ std::shared_ptr<CompilationContext> Executor::optimizeAndCodegenGPU(
                                       cgen_state_.get(),
                                       row_func_not_inlined};
   std::shared_ptr<GpuCompilationContext> compilation_context;
+
+  if (check_module_requires_libdevice(module)) {
+    if (g_rt_libdevice_module == nullptr) {
+      // raise error
+      throw std::runtime_error(
+          "libdevice library is not available but required by the UDF module");
+    }
+
+    // Bind libdevice it to the current module
+    CodeGenerator::link_udf_module(g_rt_libdevice_module,
+                                   *module,
+                                   cgen_state_.get(),
+                                   llvm::Linker::Flags::OverrideFromSrc);
+
+    // activate nvvm-reflect-ftz flag on the module
+    module->addModuleFlag(llvm::Module::Override, "nvvm-reflect-ftz", (int)1);
+    for (llvm::Function& fn : *module) {
+      fn.addFnAttr("nvptx-f32ftz", "true");
+    }
+  }
+
   try {
     compilation_context = CodeGenerator::generateNativeGPUCode(
         query_func, multifrag_query_func, live_funcs, co, gpu_target);
@@ -941,17 +1117,18 @@ std::string CodeGenerator::generatePTX(const std::string& cuda_llir,
 #if LLVM_VERSION_MAJOR >= 10
     nvptx_target_machine->addPassesToEmitFile(
         ptxgen_pm, formatted_os, nullptr, llvm::CGFT_AssemblyFile);
-#elif LLVM_VERSION_MAJOR >= 7
-    nvptx_target_machine->addPassesToEmitFile(
-        ptxgen_pm, formatted_os, nullptr, llvm::TargetMachine::CGFT_AssemblyFile);
 #else
     nvptx_target_machine->addPassesToEmitFile(
-        ptxgen_pm, formatted_os, llvm::TargetMachine::CGFT_AssemblyFile);
+        ptxgen_pm, formatted_os, nullptr, llvm::TargetMachine::CGFT_AssemblyFile);
 #endif
     ptxgen_pm.run(*module);
   }
 
+#if LLVM_VERSION_MAJOR >= 11
+  return std::string(code_str);
+#else
   return code_str.str();
+#endif
 }
 
 std::unique_ptr<llvm::TargetMachine> CodeGenerator::initializeNVPTXBackend(
@@ -1000,13 +1177,13 @@ bool CodeGenerator::alwaysCloneRuntimeFunction(const llvm::Function* func) {
          func->getName() == "fixed_width_double_decode" ||
          func->getName() == "fixed_width_float_decode" ||
          func->getName() == "fixed_width_small_date_decode" ||
-         func->getName() == "record_error_code";
+         func->getName() == "record_error_code" || func->getName() == "get_error_code";
 }
 
 llvm::Module* read_template_module(llvm::LLVMContext& context) {
   llvm::SMDiagnostic err;
 
-  auto buffer_or_error = llvm::MemoryBuffer::getFile(mapd_root_abs_path() +
+  auto buffer_or_error = llvm::MemoryBuffer::getFile(omnisci::get_root_abs_path() +
                                                      "/QueryEngine/RuntimeFunctions.bc");
   CHECK(!buffer_or_error.getError());
   llvm::MemoryBuffer* buffer = buffer_or_error.get().get();
@@ -1019,12 +1196,55 @@ llvm::Module* read_template_module(llvm::LLVMContext& context) {
   return module;
 }
 
+#ifdef HAVE_CUDA
+llvm::Module* read_libdevice_module(llvm::LLVMContext& context) {
+  llvm::SMDiagnostic err;
+
+  const char* CUDA_DEFAULT_PATH = "/usr/local/cuda";
+  const char* env = nullptr;
+
+  if (!(env = getenv("CUDA_HOME")) && !(env = getenv("CUDA_DIR"))) {
+    // check if the default CUDA directory exists: /usr/local/cuda
+    if (boost::filesystem::exists(boost::filesystem::path(CUDA_DEFAULT_PATH)))
+      env = CUDA_DEFAULT_PATH;
+  }
+
+  if (env == nullptr) {
+    LOG(WARNING) << "Could not find CUDA installation path: environment variables "
+                    "CUDA_HOME or CUDA_DIR are not defined";
+    return nullptr;
+  }
+
+  boost::filesystem::path cuda_path{env};
+  cuda_path /= "nvvm";
+  cuda_path /= "libdevice";
+  cuda_path /= "libdevice.10.bc";
+
+  if (!boost::filesystem::exists(cuda_path)) {
+    LOG(WARNING) << "Could not find CUDA libdevice; support for some UDF "
+                    "functions might not be available.";
+    return nullptr;
+  }
+
+  auto buffer_or_error = llvm::MemoryBuffer::getFile(cuda_path.c_str());
+  CHECK(!buffer_or_error.getError());
+  llvm::MemoryBuffer* buffer = buffer_or_error.get().get();
+
+  auto owner = llvm::parseBitcodeFile(buffer->getMemBufferRef(), context);
+  CHECK(!owner.takeError());
+  auto module = owner.get().release();
+  CHECK(module);
+
+  return module;
+}
+#endif
+
 #ifdef ENABLE_GEOS
 llvm::Module* read_geos_module(llvm::LLVMContext& context) {
   llvm::SMDiagnostic err;
 
-  auto buffer_or_error =
-      llvm::MemoryBuffer::getFile(mapd_root_abs_path() + "/QueryEngine/GeosRuntime.bc");
+  auto buffer_or_error = llvm::MemoryBuffer::getFile(omnisci::get_root_abs_path() +
+                                                     "/QueryEngine/GeosRuntime.bc");
   CHECK(!buffer_or_error.getError());
   llvm::MemoryBuffer* buffer = buffer_or_error.get().get();
 
@@ -1115,13 +1335,11 @@ void set_row_func_argnames(llvm::Function* row_func,
   arg_it->setName("join_hash_tables");
 }
 
-std::pair<llvm::Function*, std::vector<llvm::Value*>> create_row_function(
-    const size_t in_col_count,
-    const size_t agg_col_count,
-    const bool hoist_literals,
-    llvm::Function* query_func,
-    llvm::Module* module,
-    llvm::LLVMContext& context) {
+llvm::Function* create_row_function(const size_t in_col_count,
+                                    const size_t agg_col_count,
+                                    const bool hoist_literals,
+                                    llvm::Module* module,
+                                    llvm::LLVMContext& context) {
   std::vector<llvm::Type*> row_process_arg_types;
 
   if (agg_col_count) {
@@ -1159,15 +1377,6 @@ std::pair<llvm::Function*, std::vector<llvm::Value*>> create_row_function(
     row_process_arg_types.push_back(llvm::Type::getInt8PtrTy(context));
   }
 
-  // Generate the function signature and column head fetches s.t.
-  // double indirection isn't needed in the inner loop
-  auto& fetch_bb = query_func->front();
-  llvm::IRBuilder<> fetch_ir_builder(&fetch_bb);
-  fetch_ir_builder.SetInsertPoint(&*fetch_bb.begin());
-  auto col_heads = generate_column_heads_load(
-      in_col_count, query_func->args().begin(), fetch_ir_builder, context);
-  CHECK_EQ(in_col_count, col_heads.size());
-
   // column buffer arguments
   for (size_t i = 0; i < in_col_count; ++i) {
     row_process_arg_types.emplace_back(llvm::Type::getInt8PtrTy(context));
@@ -1186,7 +1395,7 @@ std::pair<llvm::Function*, std::vector<llvm::Value*>> create_row_function(
   // set the row function argument names; for debugging purposes only
   set_row_func_argnames(row_func, in_col_count, agg_col_count, hoist_literals);
 
-  return std::make_pair(row_func, col_heads);
+  return row_func;
 }
 
 void bind_query(llvm::Function* query_func,
@@ -1321,6 +1530,11 @@ std::unique_ptr<llvm::Module> g_rt_module(read_template_module(getGlobalLLVMCont
 std::unique_ptr<llvm::Module> g_rt_geos_module(read_geos_module(getGlobalLLVMContext()));
 #endif
 
+#ifdef HAVE_CUDA
+std::unique_ptr<llvm::Module> g_rt_libdevice_module(
+    read_libdevice_module(getGlobalLLVMContext()));
+#endif
+
 bool is_udf_module_present(bool cpu_only) {
   return (cpu_only || udf_gpu_module != nullptr) && (udf_cpu_module != nullptr);
 }
@@ -1446,10 +1660,14 @@ llvm::Value* find_variable_in_basic_block(llvm::Function* func,
 }
 };  // namespace
 
-void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
-                                           bool run_with_dynamic_watchdog,
-                                           bool run_with_allowing_runtime_interrupt,
-                                           ExecutorDeviceType device_type) {
+void Executor::createErrorCheckControlFlow(
+    llvm::Function* query_func,
+    bool run_with_dynamic_watchdog,
+    bool run_with_allowing_runtime_interrupt,
+    ExecutorDeviceType device_type,
+    const std::vector<InputTableInfo>& input_table_infos) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
+
   // check whether the row processing was successful; currently, it can
   // fail by running out of group by buffer slots
 
@@ -1481,14 +1699,15 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
       if (!llvm::isa<llvm::CallInst>(*inst_it)) {
         continue;
       }
-      auto& filter_call = llvm::cast<llvm::CallInst>(*inst_it);
-      if (std::string(filter_call.getCalledFunction()->getName()) == "row_process") {
+      auto& row_func_call = llvm::cast<llvm::CallInst>(*inst_it);
+      if (std::string(row_func_call.getCalledFunction()->getName()) == "row_process") {
         auto next_inst_it = inst_it;
         ++next_inst_it;
         auto new_bb = bb_it->splitBasicBlock(next_inst_it);
         auto& br_instr = bb_it->back();
         llvm::IRBuilder<> ir_builder(&br_instr);
         llvm::Value* err_lv = &*inst_it;
+        llvm::Value* err_lv_returned_from_row_func = nullptr;
         if (run_with_dynamic_watchdog) {
           CHECK(pos);
           llvm::Value* call_watchdog_lv = nullptr;
@@ -1548,20 +1767,61 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           if (device_type == ExecutorDeviceType::GPU) {
             // approximate how many times the %pos variable
             // is increased --> the number of iteration
+            // here we calculate the # bit shift by considering grid/block/fragment sizes
+            // since if we use the fixed one (i.e., per 64-th increment)
+            // some CUDA threads cannot enter the interrupt checking block depending on
+            // the fragment size --> a thread may not take care of 64 threads if an outer
+            // table is not sufficiently large, and so cannot be interrupted
             int32_t num_shift_by_gridDim = getExpOfTwo(gridSize());
             int32_t num_shift_by_blockDim = getExpOfTwo(blockSize());
-            if (!isPowOfTwo(gridSize())) {
-              num_shift_by_gridDim++;
-            }
-            if (!isPowOfTwo(blockSize())) {
-              num_shift_by_blockDim++;
-            }
             int total_num_shift = num_shift_by_gridDim + num_shift_by_blockDim;
-            // check the interrupt flag for every 64th iteration
+            uint64_t interrupt_checking_freq = 32;
+            auto freq_control_knob = g_running_query_interrupt_freq;
+            CHECK_GT(freq_control_knob, 0);
+            CHECK_LE(freq_control_knob, 1.0);
+            if (!input_table_infos.empty()) {
+              const auto& outer_table_info = *input_table_infos.begin();
+              auto num_outer_table_tuples = outer_table_info.info.getNumTuples();
+              if (outer_table_info.table_id < 0) {
+                auto* rs = (*outer_table_info.info.fragments.begin()).resultSet;
+                CHECK(rs);
+                num_outer_table_tuples = rs->entryCount();
+              } else {
+                auto num_frags = outer_table_info.info.fragments.size();
+                if (num_frags > 0) {
+                  num_outer_table_tuples =
+                      outer_table_info.info.fragments.begin()->getNumTuples();
+                }
+              }
+              if (num_outer_table_tuples > 0) {
+                // gridSize * blockSize --> pos_step (idx of the next row per thread)
+                // we additionally multiply two to pos_step since the number of
+                // dispatched blocks are double of the gridSize
+                // # tuples (of fragment) / pos_step --> maximum # increment (K)
+                // also we multiply 1 / freq_control_knob to K to control the frequency
+                // So, needs to check the interrupt status more frequently? make K smaller
+                auto max_inc = uint64_t(
+                    floor(num_outer_table_tuples / (gridSize() * blockSize() * 2)));
+                auto calibrated_inc = uint64_t(floor(max_inc * (1 - freq_control_knob)));
+                interrupt_checking_freq = uint64_t(pow(2, getExpOfTwo(calibrated_inc)));
+                if (interrupt_checking_freq < 4) {
+                  interrupt_checking_freq = 4;
+                }
+                // add the coverage when interrupt_checking_freq > K
+                // if so, some threads still cannot be branched to the interrupt checker
+                // so we manually use smaller but close to the max_inc as freq
+                if (interrupt_checking_freq > max_inc) {
+                  interrupt_checking_freq = max_inc / 2;
+                }
+              }
+            }
+            VLOG(1) << "Set the running query interrupt checking frequency: "
+                    << interrupt_checking_freq;
+            // check the interrupt flag for every interrupt_checking_freq-th iteration
             llvm::Value* pos_shifted_per_iteration =
                 ir_builder.CreateLShr(pos, cgen_state_->llInt(total_num_shift));
             auto interrupt_predicate =
-                ir_builder.CreateAnd(pos_shifted_per_iteration, uint64_t(0x3f));
+                ir_builder.CreateAnd(pos_shifted_per_iteration, interrupt_checking_freq);
             call_check_interrupt_lv =
                 ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
                                       interrupt_predicate,
@@ -1599,24 +1859,16 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           unified_err_lv->addIncoming(err_lv, &*bb_it);
           err_lv = unified_err_lv;
         }
-        const auto error_code_arg = get_arg_by_name(query_func, "error_code");
-        err_lv =
-            ir_builder.CreateCall(cgen_state_->module_->getFunction("record_error_code"),
-                                  std::vector<llvm::Value*>{err_lv, error_code_arg});
-        if (device_type == ExecutorDeviceType::GPU) {
+        if (!err_lv_returned_from_row_func) {
+          err_lv_returned_from_row_func = err_lv;
+        }
+        if (device_type == ExecutorDeviceType::GPU && g_enable_dynamic_watchdog) {
           // let kernel execution finish as expected, regardless of the observed error,
           // unless it is from the dynamic watchdog where all threads within that block
           // return together.
-          if (run_with_allowing_runtime_interrupt) {
-            err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
-                                           err_lv,
-                                           cgen_state_->llInt(Executor::ERR_INTERRUPTED));
-          } else {
-            err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
-                                           err_lv,
-                                           cgen_state_->llInt(Executor::ERR_OUT_OF_TIME));
-          }
-
+          err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                         err_lv,
+                                         cgen_state_->llInt(Executor::ERR_OUT_OF_TIME));
         } else {
           err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_NE,
                                          err_lv,
@@ -1624,6 +1876,12 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
         }
         auto error_bb = llvm::BasicBlock::Create(
             cgen_state_->context_, ".error_exit", query_func, new_bb);
+        const auto error_code_arg = get_arg_by_name(query_func, "error_code");
+        llvm::CallInst::Create(
+            cgen_state_->module_->getFunction("record_error_code"),
+            std::vector<llvm::Value*>{err_lv_returned_from_row_func, error_code_arg},
+            "",
+            error_bb);
         llvm::ReturnInst::Create(cgen_state_->context_, error_bb);
         llvm::ReplaceInstWithInst(&br_instr,
                                   llvm::BranchInst::Create(error_bb, new_bb, err_lv));
@@ -1636,6 +1894,8 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
 }
 
 std::vector<llvm::Value*> Executor::inlineHoistedLiterals() {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
+
   std::vector<llvm::Value*> hoisted_literals;
 
   // row_func_ is using literals whose defs have been hoisted up to the query_func_,
@@ -1663,36 +1923,84 @@ std::vector<llvm::Value*> Executor::inlineHoistedLiterals() {
                              "row_func_hoisted_literals",
                              cgen_state_->row_func_->getParent());
 
-  // make sure it's in-lined, we don't want register spills in the inner loop
-  mark_function_always_inline(row_func_with_hoisted_literals);
-
-  auto arg_it = row_func_with_hoisted_literals->arg_begin();
+  auto row_func_arg_it = row_func_with_hoisted_literals->arg_begin();
   for (llvm::Function::arg_iterator I = cgen_state_->row_func_->arg_begin(),
                                     E = cgen_state_->row_func_->arg_end();
        I != E;
        ++I) {
     if (I->hasName()) {
-      arg_it->setName(I->getName());
+      row_func_arg_it->setName(I->getName());
     }
-    ++arg_it;
+    ++row_func_arg_it;
+  }
+
+  decltype(row_func_with_hoisted_literals) filter_func_with_hoisted_literals{nullptr};
+  decltype(row_func_arg_it) filter_func_arg_it{nullptr};
+  if (cgen_state_->filter_func_) {
+    // filter_func_ is using literals whose defs have been hoisted up to the row_func_,
+    // extend filter_func_ signature to include extra args to pass these literal values.
+    std::vector<llvm::Type*> filter_func_arg_types;
+
+    for (llvm::Function::arg_iterator I = cgen_state_->filter_func_->arg_begin(),
+                                      E = cgen_state_->filter_func_->arg_end();
+         I != E;
+         ++I) {
+      filter_func_arg_types.push_back(I->getType());
+    }
+
+    for (auto& element : cgen_state_->query_func_literal_loads_) {
+      for (auto value : element.second) {
+        filter_func_arg_types.push_back(value->getType());
+      }
+    }
+
+    auto ft2 = llvm::FunctionType::get(
+        get_int_type(32, cgen_state_->context_), filter_func_arg_types, false);
+    filter_func_with_hoisted_literals =
+        llvm::Function::Create(ft2,
+                               llvm::Function::ExternalLinkage,
+                               "filter_func_hoisted_literals",
+                               cgen_state_->filter_func_->getParent());
+
+    filter_func_arg_it = filter_func_with_hoisted_literals->arg_begin();
+    for (llvm::Function::arg_iterator I = cgen_state_->filter_func_->arg_begin(),
+                                      E = cgen_state_->filter_func_->arg_end();
+         I != E;
+         ++I) {
+      if (I->hasName()) {
+        filter_func_arg_it->setName(I->getName());
+      }
+      ++filter_func_arg_it;
+    }
   }
 
   std::unordered_map<int, std::vector<llvm::Value*>>
-      query_func_literal_loads_function_arguments;
+      query_func_literal_loads_function_arguments,
+      query_func_literal_loads_function_arguments2;
 
   for (auto& element : cgen_state_->query_func_literal_loads_) {
-    std::vector<llvm::Value*> argument_values;
+    std::vector<llvm::Value*> argument_values, argument_values2;
 
     for (auto value : element.second) {
       hoisted_literals.push_back(value);
-      argument_values.push_back(&*arg_it);
-      if (value->hasName()) {
-        arg_it->setName("arg_" + value->getName());
+      argument_values.push_back(&*row_func_arg_it);
+      if (cgen_state_->filter_func_) {
+        argument_values2.push_back(&*filter_func_arg_it);
+        cgen_state_->filter_func_args_[&*row_func_arg_it] = &*filter_func_arg_it;
       }
-      ++arg_it;
+      if (value->hasName()) {
+        row_func_arg_it->setName("arg_" + value->getName());
+        if (cgen_state_->filter_func_) {
+          filter_func_arg_it->getContext();
+          filter_func_arg_it->setName("arg_" + value->getName());
+        }
+      }
+      ++row_func_arg_it;
+      ++filter_func_arg_it;
     }
 
     query_func_literal_loads_function_arguments[element.first] = argument_values;
+    query_func_literal_loads_function_arguments2[element.first] = argument_values2;
   }
 
   // copy the row_func function body over
@@ -1710,6 +2018,7 @@ std::vector<llvm::Value*> Executor::inlineHoistedLiterals() {
        ++I) {
     I->replaceAllUsesWith(&*I2);
     I2->takeName(&*I);
+    cgen_state_->filter_func_args_.replace(&*I, &*I2);
     ++I2;
   }
 
@@ -1737,6 +2046,53 @@ std::vector<llvm::Value*> Executor::inlineHoistedLiterals() {
   }
   for (auto placeholder : placeholders) {
     placeholder->removeFromParent();
+  }
+
+  if (cgen_state_->filter_func_) {
+    // copy the filter_func function body over
+    // see
+    // https://stackoverflow.com/questions/12864106/move-function-body-avoiding-full-cloning/18751365
+    filter_func_with_hoisted_literals->getBasicBlockList().splice(
+        filter_func_with_hoisted_literals->begin(),
+        cgen_state_->filter_func_->getBasicBlockList());
+
+    // also replace filter_func arguments with the arguments from
+    // filter_func_hoisted_literals
+    for (llvm::Function::arg_iterator I = cgen_state_->filter_func_->arg_begin(),
+                                      E = cgen_state_->filter_func_->arg_end(),
+                                      I2 = filter_func_with_hoisted_literals->arg_begin();
+         I != E;
+         ++I) {
+      I->replaceAllUsesWith(&*I2);
+      I2->takeName(&*I);
+      ++I2;
+    }
+
+    cgen_state_->filter_func_ = filter_func_with_hoisted_literals;
+
+    // and finally replace  literal placeholders
+    std::vector<llvm::Instruction*> placeholders;
+    std::string prefix("__placeholder__literal_");
+    for (auto it = llvm::inst_begin(filter_func_with_hoisted_literals),
+              e = llvm::inst_end(filter_func_with_hoisted_literals);
+         it != e;
+         ++it) {
+      if (it->hasName() && it->getName().startswith(prefix)) {
+        auto offset_and_index_entry = cgen_state_->row_func_hoisted_literals_.find(
+            llvm::dyn_cast<llvm::Value>(&*it));
+        CHECK(offset_and_index_entry != cgen_state_->row_func_hoisted_literals_.end());
+
+        int lit_off = offset_and_index_entry->second.offset_in_literal_buffer;
+        int lit_idx = offset_and_index_entry->second.index_of_literal_load;
+
+        it->replaceAllUsesWith(
+            query_func_literal_loads_function_arguments2[lit_off][lit_idx]);
+        placeholders.push_back(&*it);
+      }
+    }
+    for (auto placeholder : placeholders) {
+      placeholder->removeFromParent();
+    }
   }
 
   return hoisted_literals;
@@ -1862,10 +2218,80 @@ bool is_gpu_shared_mem_supported(const QueryMemoryDescriptor* query_mem_desc_ptr
   return false;
 }
 
+#ifndef NDEBUG
+std::string serialize_llvm_metadata_footnotes(llvm::Function* query_func,
+                                              CgenState* cgen_state) {
+  std::string llvm_ir;
+  std::unordered_set<llvm::MDNode*> md;
+
+  // Loop over all instructions in the query function.
+  for (auto bb_it = query_func->begin(); bb_it != query_func->end(); ++bb_it) {
+    for (auto instr_it = bb_it->begin(); instr_it != bb_it->end(); ++instr_it) {
+      llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 100> imd;
+      instr_it->getAllMetadata(imd);
+      for (auto [kind, node] : imd) {
+        md.insert(node);
+      }
+    }
+  }
+
+  // Loop over all instructions in the row function.
+  for (auto bb_it = cgen_state->row_func_->begin(); bb_it != cgen_state->row_func_->end();
+       ++bb_it) {
+    for (auto instr_it = bb_it->begin(); instr_it != bb_it->end(); ++instr_it) {
+      llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 100> imd;
+      instr_it->getAllMetadata(imd);
+      for (auto [kind, node] : imd) {
+        md.insert(node);
+      }
+    }
+  }
+
+  // Loop over all instructions in the filter function.
+  if (cgen_state->filter_func_) {
+    for (auto bb_it = cgen_state->filter_func_->begin();
+         bb_it != cgen_state->filter_func_->end();
+         ++bb_it) {
+      for (auto instr_it = bb_it->begin(); instr_it != bb_it->end(); ++instr_it) {
+        llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 100> imd;
+        instr_it->getAllMetadata(imd);
+        for (auto [kind, node] : imd) {
+          md.insert(node);
+        }
+      }
+    }
+  }
+
+  // Sort the metadata by canonical number and convert to text.
+  if (!md.empty()) {
+    std::map<size_t, std::string> sorted_strings;
+    for (auto p : md) {
+      std::string str;
+      llvm::raw_string_ostream os(str);
+      p->print(os, cgen_state->module_, true);
+      os.flush();
+      auto fields = split(str, {}, 1);
+      if (fields.empty() || fields[0].empty()) {
+        continue;
+      }
+      sorted_strings.emplace(std::stoul(fields[0].substr(1)), str);
+    }
+    llvm_ir += "\n";
+    for (auto [id, text] : sorted_strings) {
+      llvm_ir += text;
+      llvm_ir += "\n";
+    }
+  }
+
+  return llvm_ir;
+}
+#endif  // NDEBUG
+
 }  // namespace
 
 std::tuple<CompilationResult, std::unique_ptr<QueryMemoryDescriptor>>
 Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
+                          const PlanState::DeletedColumnsMap& deleted_cols_map,
                           const RelAlgExecutionUnit& ra_exe_unit,
                           const CompilationOptions& co,
                           const ExecutionOptions& eo,
@@ -1878,10 +2304,26 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                           ColumnCacheMap& column_cache,
                           RenderInfo* render_info) {
   auto timer = DEBUG_TIMER(__func__);
-  nukeOldState(allow_lazy_fetch, query_infos, &ra_exe_unit);
+
+#ifndef NDEBUG
+  static std::uint64_t counter = 0;
+  ++counter;
+  VLOG(1) << "CODEGEN #" << counter << ":";
+  LOG(IR) << "CODEGEN #" << counter << ":";
+  LOG(PTX) << "CODEGEN #" << counter << ":";
+  LOG(ASM) << "CODEGEN #" << counter << ":";
+#endif
+
+  nukeOldState(allow_lazy_fetch, query_infos, deleted_cols_map, &ra_exe_unit);
 
   GroupByAndAggregate group_by_and_aggregate(
-      this, co.device_type, ra_exe_unit, query_infos, row_set_mem_owner);
+      this,
+      co.device_type,
+      ra_exe_unit,
+      query_infos,
+      row_set_mem_owner,
+      has_cardinality_estimation ? std::optional<int64_t>(max_groups_buffer_entry_guess)
+                                 : std::nullopt);
   auto query_mem_desc =
       group_by_and_aggregate.initQueryMemoryDescriptor(eo.allow_multifrag,
                                                        max_groups_buffer_entry_guess,
@@ -1893,7 +2335,8 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
           QueryDescriptionType::GroupByBaselineHash &&
       !has_cardinality_estimation &&
       (!render_info || !render_info->isPotentialInSituRender()) && !eo.just_explain) {
-    throw CardinalityEstimationRequired();
+    const auto col_range_info = group_by_and_aggregate.getColRangeInfo();
+    throw CardinalityEstimationRequired(col_range_info.max - col_range_info.min);
   }
 
   const bool output_columnar = query_mem_desc->didOutputColumnar();
@@ -1935,13 +2378,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   // by binding the stream position functions to the right implementation:
   // stride access for GPU, contiguous for CPU
   auto rt_module_copy = llvm::CloneModule(
-#if LLVM_VERSION_MAJOR >= 7
-      *g_rt_module.get(),
-#else
-      g_rt_module.get(),
-#endif
-      cgen_state_->vmap_,
-      [](const llvm::GlobalValue* gv) {
+      *g_rt_module.get(), cgen_state_->vmap_, [](const llvm::GlobalValue* gv) {
         auto func = llvm::dyn_cast<llvm::Function>(gv);
         if (!func) {
           return true;
@@ -1979,6 +2416,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   }
 
   cgen_state_->module_ = rt_module_copy.release();
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
 
   auto agg_fnames =
       get_agg_fnames(ra_exe_unit.target_exprs, !ra_exe_unit.groupby_exprs.empty());
@@ -1986,54 +2424,78 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   const auto agg_slot_count = ra_exe_unit.estimator ? size_t(1) : agg_fnames.size();
 
   const bool is_group_by{query_mem_desc->isGroupBy()};
-  auto query_func = is_group_by ? query_group_by_template(cgen_state_->module_,
+  auto [query_func, row_func_call] = is_group_by
+                                         ? query_group_by_template(cgen_state_->module_,
+                                                                   co.hoist_literals,
+                                                                   *query_mem_desc,
+                                                                   co.device_type,
+                                                                   ra_exe_unit.scan_limit,
+                                                                   gpu_smem_context)
+                                         : query_template(cgen_state_->module_,
+                                                          agg_slot_count,
                                                           co.hoist_literals,
-                                                          *query_mem_desc,
-                                                          co.device_type,
-                                                          ra_exe_unit.scan_limit,
-                                                          gpu_smem_context)
-                                : query_template(cgen_state_->module_,
-                                                 agg_slot_count,
-                                                 co.hoist_literals,
-                                                 !!ra_exe_unit.estimator,
-                                                 gpu_smem_context);
+                                                          !!ra_exe_unit.estimator,
+                                                          gpu_smem_context);
   bind_pos_placeholders("pos_start", true, query_func, cgen_state_->module_);
   bind_pos_placeholders("group_buff_idx", false, query_func, cgen_state_->module_);
   bind_pos_placeholders("pos_step", false, query_func, cgen_state_->module_);
 
   cgen_state_->query_func_ = query_func;
+  cgen_state_->row_func_call_ = row_func_call;
   cgen_state_->query_func_entry_ir_builder_.SetInsertPoint(
       &query_func->getEntryBlock().front());
 
-  std::vector<llvm::Value*> col_heads;
-  std::tie(cgen_state_->row_func_, col_heads) =
-      create_row_function(ra_exe_unit.input_col_descs.size(),
-                          is_group_by ? 0 : agg_slot_count,
-                          co.hoist_literals,
-                          query_func,
-                          cgen_state_->module_,
-                          cgen_state_->context_);
+  // Generate the function signature and column head fetches s.t.
+  // double indirection isn't needed in the inner loop
+  auto& fetch_bb = query_func->front();
+  llvm::IRBuilder<> fetch_ir_builder(&fetch_bb);
+  fetch_ir_builder.SetInsertPoint(&*fetch_bb.begin());
+  auto col_heads = generate_column_heads_load(ra_exe_unit.input_col_descs.size(),
+                                              query_func->args().begin(),
+                                              fetch_ir_builder,
+                                              cgen_state_->context_);
+  CHECK_EQ(ra_exe_unit.input_col_descs.size(), col_heads.size());
+
+  cgen_state_->row_func_ = create_row_function(ra_exe_unit.input_col_descs.size(),
+                                               is_group_by ? 0 : agg_slot_count,
+                                               co.hoist_literals,
+                                               cgen_state_->module_,
+                                               cgen_state_->context_);
   CHECK(cgen_state_->row_func_);
-  // make sure it's in-lined, we don't want register spills in the inner loop
-  mark_function_always_inline(cgen_state_->row_func_);
-  auto bb =
+  cgen_state_->row_func_bb_ =
       llvm::BasicBlock::Create(cgen_state_->context_, "entry", cgen_state_->row_func_);
-  cgen_state_->ir_builder_.SetInsertPoint(bb);
+
+  if (g_enable_filter_function) {
+    auto filter_func_ft =
+        llvm::FunctionType::get(get_int_type(32, cgen_state_->context_), {}, false);
+    cgen_state_->filter_func_ = llvm::Function::Create(filter_func_ft,
+                                                       llvm::Function::ExternalLinkage,
+                                                       "filter_func",
+                                                       cgen_state_->module_);
+    CHECK(cgen_state_->filter_func_);
+    cgen_state_->filter_func_bb_ = llvm::BasicBlock::Create(
+        cgen_state_->context_, "entry", cgen_state_->filter_func_);
+  }
+
+  cgen_state_->current_func_ = cgen_state_->row_func_;
+  cgen_state_->ir_builder_.SetInsertPoint(cgen_state_->row_func_bb_);
+
   preloadFragOffsets(ra_exe_unit.input_descs, query_infos);
   RelAlgExecutionUnit body_execution_unit = ra_exe_unit;
   const auto join_loops =
       buildJoinLoops(body_execution_unit, co, eo, query_infos, column_cache);
+
   plan_state_->allocateLocalColumnIds(ra_exe_unit.input_col_descs);
   const auto is_not_deleted_bb = codegenSkipDeletedOuterTableRow(ra_exe_unit, co);
   if (is_not_deleted_bb) {
-    bb = is_not_deleted_bb;
+    cgen_state_->row_func_bb_ = is_not_deleted_bb;
   }
   if (!join_loops.empty()) {
     codegenJoinLoops(join_loops,
                      body_execution_unit,
                      group_by_and_aggregate,
                      query_func,
-                     bb,
+                     cgen_state_->row_func_bb_,
                      *(query_mem_desc.get()),
                      co,
                      eo);
@@ -2045,7 +2507,8 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
       createErrorCheckControlFlow(query_func,
                                   eo.with_dynamic_watchdog,
                                   eo.allow_runtime_query_interrupt,
-                                  co.device_type);
+                                  co.device_type,
+                                  group_by_and_aggregate.query_infos_);
     }
   }
   std::vector<llvm::Value*> hoisted_literals;
@@ -2061,30 +2524,35 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
     // we have some hoisted literals...
     hoisted_literals = inlineHoistedLiterals();
   }
-  // iterate through all the instruction in the query template function and
-  // replace the call to the filter placeholder with the call to the actual filter
-  for (auto it = llvm::inst_begin(query_func), e = llvm::inst_end(query_func); it != e;
-       ++it) {
-    if (!llvm::isa<llvm::CallInst>(*it)) {
-      continue;
-    }
-    auto& filter_call = llvm::cast<llvm::CallInst>(*it);
-    if (std::string(filter_call.getCalledFunction()->getName()) == "row_process") {
-      std::vector<llvm::Value*> args;
-      for (size_t i = 0; i < filter_call.getNumArgOperands(); ++i) {
-        args.push_back(filter_call.getArgOperand(i));
-      }
-      args.insert(args.end(), col_heads.begin(), col_heads.end());
-      args.push_back(get_arg_by_name(query_func, "join_hash_tables"));
-      // push hoisted literals arguments, if any
-      args.insert(args.end(), hoisted_literals.begin(), hoisted_literals.end());
 
-      llvm::ReplaceInstWithInst(&filter_call,
-                                llvm::CallInst::Create(cgen_state_->row_func_, args, ""));
-      break;
+  // replace the row func placeholder call with the call to the actual row func
+  std::vector<llvm::Value*> row_func_args;
+  for (size_t i = 0; i < cgen_state_->row_func_call_->getNumArgOperands(); ++i) {
+    row_func_args.push_back(cgen_state_->row_func_call_->getArgOperand(i));
+  }
+  row_func_args.insert(row_func_args.end(), col_heads.begin(), col_heads.end());
+  row_func_args.push_back(get_arg_by_name(query_func, "join_hash_tables"));
+  // push hoisted literals arguments, if any
+  row_func_args.insert(
+      row_func_args.end(), hoisted_literals.begin(), hoisted_literals.end());
+  llvm::ReplaceInstWithInst(
+      cgen_state_->row_func_call_,
+      llvm::CallInst::Create(cgen_state_->row_func_, row_func_args, ""));
+
+  // replace the filter func placeholder call with the call to the actual filter func
+  if (cgen_state_->filter_func_) {
+    std::vector<llvm::Value*> filter_func_args;
+    for (auto arg_it = cgen_state_->filter_func_args_.begin();
+         arg_it != cgen_state_->filter_func_args_.end();
+         ++arg_it) {
+      filter_func_args.push_back(arg_it->first);
     }
+    llvm::ReplaceInstWithInst(
+        cgen_state_->filter_func_call_,
+        llvm::CallInst::Create(cgen_state_->filter_func_, filter_func_args, ""));
   }
 
+  // Aggregate
   plan_state_->init_agg_vals_ =
       init_agg_val_vec(ra_exe_unit.target_exprs, ra_exe_unit.quals, *query_mem_desc);
 
@@ -2118,16 +2586,37 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
       "multifrag_query" + std::string(co.hoist_literals ? "_hoisted_literals" : ""));
   CHECK(multifrag_query_func);
 
+  if (co.device_type == ExecutorDeviceType::GPU && eo.allow_multifrag) {
+    insertErrorCodeChecker(multifrag_query_func, co.hoist_literals);
+  }
+
   bind_query(query_func,
              "query_stub" + std::string(co.hoist_literals ? "_hoisted_literals" : ""),
              multifrag_query_func,
              cgen_state_->module_);
 
-  auto live_funcs =
-      CodeGenerator::markDeadRuntimeFuncs(*cgen_state_->module_,
-                                          {query_func, cgen_state_->row_func_},
-                                          {multifrag_query_func});
+  std::vector<llvm::Function*> root_funcs{query_func, cgen_state_->row_func_};
+  if (cgen_state_->filter_func_) {
+    root_funcs.push_back(cgen_state_->filter_func_);
+  }
+  auto live_funcs = CodeGenerator::markDeadRuntimeFuncs(
+      *cgen_state_->module_, root_funcs, {multifrag_query_func});
 
+  // Always inline the row function and the filter function.
+  // We don't want register spills in the inner loops.
+  // LLVM seems to correctly free up alloca instructions
+  // in these functions even when they are inlined.
+  mark_function_always_inline(cgen_state_->row_func_);
+  if (cgen_state_->filter_func_) {
+    mark_function_always_inline(cgen_state_->filter_func_);
+  }
+
+#ifndef NDEBUG
+  // Add helpful metadata to the LLVM IR for debugging.
+  AUTOMATIC_IR_METADATA_DONE();
+#endif
+
+  // Serialize the important LLVM IR functions to text for SQL EXPLAIN.
   std::string llvm_ir;
   if (eo.just_explain) {
     if (co.explain_type == ExecutorExplainType::Optimized) {
@@ -2142,14 +2631,36 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 #endif  // WITH_JIT_DEBUG
     }
     llvm_ir =
-        serialize_llvm_object(query_func) + serialize_llvm_object(cgen_state_->row_func_);
+        serialize_llvm_object(multifrag_query_func) + serialize_llvm_object(query_func) +
+        serialize_llvm_object(cgen_state_->row_func_) +
+        (cgen_state_->filter_func_ ? serialize_llvm_object(cgen_state_->filter_func_)
+                                   : "");
+
+#ifndef NDEBUG
+    llvm_ir += serialize_llvm_metadata_footnotes(query_func, cgen_state_.get());
+#endif
   }
+
+  LOG(IR) << "\n\n" << query_mem_desc->toString() << "\n";
+  LOG(IR) << "IR for the "
+          << (co.device_type == ExecutorDeviceType::CPU ? "CPU:\n" : "GPU:\n");
+#ifdef NDEBUG
+  LOG(IR) << serialize_llvm_object(query_func)
+          << serialize_llvm_object(cgen_state_->row_func_)
+          << (cgen_state_->filter_func_ ? serialize_llvm_object(cgen_state_->filter_func_)
+                                        : "")
+          << "\nEnd of IR";
+#else
+  LOG(IR) << serialize_llvm_object(cgen_state_->module_) << "\nEnd of IR";
+#endif
+
+  // Run some basic validation checks on the LLVM IR before code is generated below.
   verify_function_ir(cgen_state_->row_func_);
+  if (cgen_state_->filter_func_) {
+    verify_function_ir(cgen_state_->filter_func_);
+  }
 
-  LOG(IR) << query_mem_desc->toString() << "\nGenerated IR\n"
-          << serialize_llvm_object(query_func)
-          << serialize_llvm_object(cgen_state_->row_func_) << "\nEnd of IR";
-
+  // Generate final native code from the LLVM IR.
   return std::make_tuple(
       CompilationResult{
           co.device_type == ExecutorDeviceType::CPU
@@ -2167,9 +2678,92 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
       std::move(query_mem_desc));
 }
 
+void Executor::insertErrorCodeChecker(llvm::Function* query_func, bool hoist_literals) {
+  auto query_stub_func_name =
+      "query_stub" + std::string(hoist_literals ? "_hoisted_literals" : "");
+  for (auto bb_it = query_func->begin(); bb_it != query_func->end(); ++bb_it) {
+    for (auto inst_it = bb_it->begin(); inst_it != bb_it->end(); ++inst_it) {
+      if (!llvm::isa<llvm::CallInst>(*inst_it)) {
+        continue;
+      }
+      auto& row_func_call = llvm::cast<llvm::CallInst>(*inst_it);
+      if (std::string(row_func_call.getCalledFunction()->getName()) ==
+          query_stub_func_name) {
+        auto next_inst_it = inst_it;
+        ++next_inst_it;
+        auto new_bb = bb_it->splitBasicBlock(next_inst_it);
+        auto& br_instr = bb_it->back();
+        llvm::IRBuilder<> ir_builder(&br_instr);
+        llvm::Value* err_lv = &*inst_it;
+        auto error_check_bb =
+            bb_it->splitBasicBlock(llvm::BasicBlock::iterator(br_instr), ".error_check");
+        llvm::Value* error_code_arg = nullptr;
+        auto arg_cnt = 0;
+        for (auto arg_it = query_func->arg_begin(); arg_it != query_func->arg_end();
+             arg_it++, ++arg_cnt) {
+          // since multi_frag_* func has anonymous arguments so we use arg_offset
+          // explicitly to capture "error_code" argument in the func's argument list
+          if (hoist_literals) {
+            if (arg_cnt == 9) {
+              error_code_arg = &*arg_it;
+              break;
+            }
+          } else {
+            if (arg_cnt == 8) {
+              error_code_arg = &*arg_it;
+              break;
+            }
+          }
+        }
+        CHECK(error_code_arg);
+        llvm::Value* err_code = nullptr;
+        if (g_enable_runtime_query_interrupt) {
+          // decide the final error code with a consideration of interrupt status
+          auto& check_interrupt_br_instr = bb_it->back();
+          auto interrupt_check_bb = llvm::BasicBlock::Create(
+              cgen_state_->context_, ".interrupt_check", query_func, error_check_bb);
+          llvm::IRBuilder<> interrupt_checker_ir_builder(interrupt_check_bb);
+          auto detected_interrupt = interrupt_checker_ir_builder.CreateCall(
+              cgen_state_->module_->getFunction("check_interrupt"), {});
+          auto detected_error = interrupt_checker_ir_builder.CreateCall(
+              cgen_state_->module_->getFunction("get_error_code"),
+              std::vector<llvm::Value*>{error_code_arg});
+          err_code = interrupt_checker_ir_builder.CreateSelect(
+              detected_interrupt,
+              cgen_state_->llInt(Executor::ERR_INTERRUPTED),
+              detected_error);
+          interrupt_checker_ir_builder.CreateBr(error_check_bb);
+          llvm::ReplaceInstWithInst(&check_interrupt_br_instr,
+                                    llvm::BranchInst::Create(interrupt_check_bb));
+          ir_builder.SetInsertPoint(&br_instr);
+        } else {
+          // uses error code returned from row_func and skip to check interrupt status
+          ir_builder.SetInsertPoint(&br_instr);
+          err_code =
+              ir_builder.CreateCall(cgen_state_->module_->getFunction("get_error_code"),
+                                    std::vector<llvm::Value*>{error_code_arg});
+        }
+        err_lv = ir_builder.CreateICmp(
+            llvm::ICmpInst::ICMP_NE, err_code, cgen_state_->llInt(0));
+        auto error_bb = llvm::BasicBlock::Create(
+            cgen_state_->context_, ".error_exit", query_func, new_bb);
+        llvm::CallInst::Create(cgen_state_->module_->getFunction("record_error_code"),
+                               std::vector<llvm::Value*>{err_code, error_code_arg},
+                               "",
+                               error_bb);
+        llvm::ReturnInst::Create(cgen_state_->context_, error_bb);
+        llvm::ReplaceInstWithInst(&br_instr,
+                                  llvm::BranchInst::Create(error_bb, new_bb, err_lv));
+        break;
+      }
+    }
+  }
+}
+
 llvm::BasicBlock* Executor::codegenSkipDeletedOuterTableRow(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   if (!co.filter_on_deleted_column) {
     return nullptr;
   }
@@ -2178,9 +2772,8 @@ llvm::BasicBlock* Executor::codegenSkipDeletedOuterTableRow(
   if (outer_input_desc.getSourceType() != InputSourceType::TABLE) {
     return nullptr;
   }
-  const auto td = catalog_->getMetadataForTable(outer_input_desc.getTableId());
-  CHECK(td);
-  const auto deleted_cd = catalog_->getDeletedColumnIfRowsDeleted(td);
+  const auto deleted_cd =
+      plan_state_->getDeletedColForTable(outer_input_desc.getTableId());
   if (!deleted_cd) {
     return nullptr;
   }
@@ -2209,6 +2802,30 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
                            const QueryMemoryDescriptor& query_mem_desc,
                            const CompilationOptions& co,
                            const GpuSharedMemoryContext& gpu_smem_context) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
+
+  // Switch the code generation into a separate filter function if enabled.
+  // Note that accesses to function arguments are still codegenned from the
+  // row function's arguments, then later automatically forwarded and
+  // remapped into filter function arguments by redeclareFilterFunction().
+  cgen_state_->row_func_bb_ = cgen_state_->ir_builder_.GetInsertBlock();
+  llvm::Value* loop_done{nullptr};
+  std::unique_ptr<Executor::FetchCacheAnchor> fetch_cache_anchor;
+  if (cgen_state_->filter_func_) {
+    if (cgen_state_->row_func_bb_->getName() == "loop_body") {
+      auto row_func_entry_bb = &cgen_state_->row_func_->getEntryBlock();
+      cgen_state_->ir_builder_.SetInsertPoint(row_func_entry_bb,
+                                              row_func_entry_bb->begin());
+      loop_done = cgen_state_->ir_builder_.CreateAlloca(
+          get_int_type(1, cgen_state_->context_), nullptr, "loop_done");
+      cgen_state_->ir_builder_.SetInsertPoint(cgen_state_->row_func_bb_);
+      cgen_state_->ir_builder_.CreateStore(cgen_state_->llBool(true), loop_done);
+    }
+    cgen_state_->ir_builder_.SetInsertPoint(cgen_state_->filter_func_bb_);
+    cgen_state_->current_func_ = cgen_state_->filter_func_;
+    fetch_cache_anchor = std::make_unique<Executor::FetchCacheAnchor>(cgen_state_.get());
+  }
+
   // generate the code for the filter
   std::vector<Analyzer::Expr*> primary_quals;
   std::vector<Analyzer::Expr*> deferred_quals;
@@ -2230,9 +2847,9 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
   llvm::BasicBlock* sc_false{nullptr};
   if (!deferred_quals.empty()) {
     auto sc_true = llvm::BasicBlock::Create(
-        cgen_state_->context_, "sc_true", cgen_state_->row_func_);
+        cgen_state_->context_, "sc_true", cgen_state_->current_func_);
     sc_false = llvm::BasicBlock::Create(
-        cgen_state_->context_, "sc_false", cgen_state_->row_func_);
+        cgen_state_->context_, "sc_false", cgen_state_->current_func_);
     cgen_state_->ir_builder_.CreateCondBr(filter_lv, sc_true, sc_false);
     cgen_state_->ir_builder_.SetInsertPoint(sc_false);
     if (ra_exe_unit.join_quals.empty()) {
@@ -2247,19 +2864,45 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
   }
 
   CHECK(filter_lv->getType()->isIntegerTy(1));
-  return group_by_and_aggregate.codegen(
+  auto ret = group_by_and_aggregate.codegen(
       filter_lv, sc_false, query_mem_desc, co, gpu_smem_context);
+
+  // Switch the code generation back to the row function if a filter
+  // function was enabled.
+  if (cgen_state_->filter_func_) {
+    if (cgen_state_->row_func_bb_->getName() == "loop_body") {
+      cgen_state_->ir_builder_.CreateStore(cgen_state_->llBool(false), loop_done);
+      cgen_state_->ir_builder_.CreateRet(cgen_state_->llInt<int32_t>(0));
+    }
+
+    redeclareFilterFunction();
+
+    cgen_state_->ir_builder_.SetInsertPoint(cgen_state_->row_func_bb_);
+    cgen_state_->current_func_ = cgen_state_->row_func_;
+    cgen_state_->filter_func_call_ =
+        cgen_state_->ir_builder_.CreateCall(cgen_state_->filter_func_, {});
+
+    if (cgen_state_->row_func_bb_->getName() == "loop_body") {
+      auto loop_done_true = llvm::BasicBlock::Create(
+          cgen_state_->context_, "loop_done_true", cgen_state_->row_func_);
+      auto loop_done_false = llvm::BasicBlock::Create(
+          cgen_state_->context_, "loop_done_false", cgen_state_->row_func_);
+      auto loop_done_flag = cgen_state_->ir_builder_.CreateLoad(loop_done);
+      cgen_state_->ir_builder_.CreateCondBr(
+          loop_done_flag, loop_done_true, loop_done_false);
+      cgen_state_->ir_builder_.SetInsertPoint(loop_done_true);
+      cgen_state_->ir_builder_.CreateRet(cgen_state_->filter_func_call_);
+      cgen_state_->ir_builder_.SetInsertPoint(loop_done_false);
+    } else {
+      cgen_state_->ir_builder_.CreateRet(cgen_state_->filter_func_call_);
+    }
+  }
+  return ret;
 }
 
 std::unique_ptr<llvm::Module> runtime_module_shallow_copy(CgenState* cgen_state) {
   return llvm::CloneModule(
-#if LLVM_VERSION_MAJOR >= 7
-      *g_rt_module.get(),
-#else
-      g_rt_module.get(),
-#endif
-      cgen_state->vmap_,
-      [](const llvm::GlobalValue* gv) {
+      *g_rt_module.get(), cgen_state->vmap_, [](const llvm::GlobalValue* gv) {
         auto func = llvm::dyn_cast<llvm::Function>(gv);
         if (!func) {
           return true;

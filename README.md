@@ -192,7 +192,7 @@ A [`.clang-tidy`](https://clang.llvm.org/extra/clang-tidy/) configuration is pro
 
 `clang-tidy` requires all generated files to exist before running. The easiest way to accomplish this is to simply run a full build before running `clang-tidy`. A build target which runs `clang-tidy` is provided. To use:
 
-    make clang-tidy
+    make run-clang-tidy
 
 Note: `clang-tidy` may make invalid or overly verbose changes to the source code. It is recommended to first commit your changes, then run `clang-tidy` and review its recommended changes before amending them to your commit.
 
@@ -204,16 +204,16 @@ OmniSciDB has the following dependencies:
 
 | Package | Min Version | Required |
 | ------- | ----------- | -------- |
-| [CMake](https://cmake.org/) | 3.3 | yes |
+| [CMake](https://cmake.org/) | 3.16 | yes |
 | [LLVM](http://llvm.org/) | 9.0 | yes |
-| [GCC](http://gcc.gnu.org/) | 8.1 | no, if building with clang |
+| [GCC](http://gcc.gnu.org/) | 8.4.0 | no, if building with clang |
 | [Go](https://golang.org/) | 1.12 | yes |
-| [Boost](http://www.boost.org/) | 1.65.0 | yes |
-| [OpenJDK](http://openjdk.java.net/) | 1.8 | yes |
-| [CUDA](http://nvidia.com/cuda) | 10.1 | yes, if compiling with GPU support |
+| [Boost](http://www.boost.org/) | 1.72.0 | yes |
+| [OpenJDK](http://openjdk.java.net/) | 1.7 | yes |
+| [CUDA](http://nvidia.com/cuda) | 11.0 | yes, if compiling with GPU support |
 | [gperftools](https://github.com/gperftools/gperftools) | | yes |
-| [gdal](http://gdal.org/) | 2.3 | yes |
-| [Arrow](https://arrow.apache.org/) | 0.16.0 | yes |
+| [gdal](http://gdal.org/) | 2.4.2 | yes |
+| [Arrow](https://arrow.apache.org/) | 1.0.0 | yes |
 
 ## CentOS 7
 

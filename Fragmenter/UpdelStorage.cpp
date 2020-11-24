@@ -25,10 +25,11 @@
 #include "DataMgr/DataMgr.h"
 #include "DataMgr/FixedLengthArrayNoneEncoder.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
+#include "LockMgr/LockMgr.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/TargetValue.h"
 #include "Shared/DateConverters.h"
-#include "Shared/Logger.h"
 #include "Shared/TypedDataAccessors.h"
 #include "Shared/thread_count.h"
 #include "TargetValueConvertersFactories.h"
@@ -49,30 +50,6 @@ inline bool is_integral(const SQLTypeInfo& t) {
 }
 
 bool FragmentInfo::unconditionalVacuum_{false};
-
-void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catalog,
-                                         const std::string& tab_name,
-                                         const std::string& col_name,
-                                         const int fragment_id,
-                                         const std::vector<uint64_t>& frag_offsets,
-                                         const std::vector<ScalarTargetValue>& rhs_values,
-                                         const SQLTypeInfo& rhs_type,
-                                         const Data_Namespace::MemoryLevel memory_level,
-                                         UpdelRoll& updel_roll) {
-  const auto td = catalog->getMetadataForTable(tab_name);
-  CHECK(td);
-  const auto cd = catalog->getMetadataForColumn(td->tableId, col_name);
-  CHECK(cd);
-  td->fragmenter->updateColumn(catalog,
-                               td,
-                               cd,
-                               fragment_id,
-                               frag_offsets,
-                               rhs_values,
-                               rhs_type,
-                               memory_level,
-                               updel_roll);
-}
 
 void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catalog,
                                          const TableDescriptor* td,
@@ -574,18 +551,19 @@ void InsertOrderFragmenter::updateColumns(
   insertDataNoCheckpoint(insert_data);
 
   // update metdata
-  if (!deletedChunk->getBuffer()->has_encoder) {
+  if (!deletedChunk->getBuffer()->hasEncoder()) {
     deletedChunk->initEncoder();
   }
-  deletedChunk->getBuffer()->encoder->updateStats(static_cast<int64_t>(true), false);
+  deletedChunk->getBuffer()->getEncoder()->updateStats(static_cast<int64_t>(true), false);
 
   auto& shadowDeletedChunkMeta =
       fragment.shadowChunkMetadataMap[deletedChunk->getColumnDesc()->columnId];
   if (shadowDeletedChunkMeta->numElements >
-      deletedChunk->getBuffer()->encoder->getNumElems()) {
+      deletedChunk->getBuffer()->getEncoder()->getNumElems()) {
     // the append will have populated shadow meta data, otherwise use existing num
     // elements
-    deletedChunk->getBuffer()->encoder->setNumElems(shadowDeletedChunkMeta->numElements);
+    deletedChunk->getBuffer()->getEncoder()->setNumElems(
+        shadowDeletedChunkMeta->numElements);
   }
   deletedChunk->getBuffer()->setUpdated();
 }
@@ -945,7 +923,7 @@ void InsertOrderFragmenter::updateColumnMetadata(const ColumnDescriptor* cd,
   auto buffer = chunk->getBuffer();
   const auto& lhs_type = cd->columnType;
 
-  auto encoder = buffer->encoder.get();
+  auto encoder = buffer->getEncoder();
   auto update_stats = [&encoder](auto min, auto max, auto has_null) {
     static_assert(std::is_same<decltype(min), decltype(max)>::value,
                   "Type mismatch on min/max");
@@ -971,10 +949,7 @@ void InsertOrderFragmenter::updateColumnMetadata(const ColumnDescriptor* cd,
              !(lhs_type.is_string() && kENCODING_DICT != lhs_type.get_compression())) {
     update_stats(min_int64t_per_chunk, max_int64t_per_chunk, has_null_per_chunk);
   }
-  buffer->encoder->getMetadata(chunkMetadata[cd->columnId]);
-
-  // removed as @alex suggests. keep it commented in case of any chance to revisit
-  // it once after vacuum code is introduced. fragment.invalidateChunkMetadataMap();
+  buffer->getEncoder()->getMetadata(chunkMetadata[cd->columnId]);
 }
 
 void InsertOrderFragmenter::updateMetadata(const Catalog_Namespace::Catalog* catalog,
@@ -1227,7 +1202,7 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
       size_t nbytes_fix_data_to_keep;
       nbytes_fix_data_to_keep = vacuum_fixlen_rows(fragment, chunk, frag_offsets);
 
-      data_buffer->encoder->setNumElems(nrows_to_keep);
+      data_buffer->getEncoder()->setNumElems(nrows_to_keep);
       data_buffer->setSize(nbytes_fix_data_to_keep);
       data_buffer->setUpdated();
 
@@ -1239,7 +1214,7 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
       for (size_t irow = 0; irow < nrows_to_keep; ++irow, daddr += element_size) {
         if (col_type.is_fixlen_array()) {
           auto encoder =
-              dynamic_cast<FixedLengthArrayNoneEncoder*>(data_buffer->encoder.get());
+              dynamic_cast<FixedLengthArrayNoneEncoder*>(data_buffer->getEncoder());
           CHECK(encoder);
           encoder->updateMetadata((int8_t*)daddr);
         } else if (col_type.is_fp()) {
@@ -1262,7 +1237,7 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
       size_t nbytes_var_data_to_keep;
       nbytes_var_data_to_keep = vacuum_varlen_rows(fragment, chunk, frag_offsets);
 
-      data_buffer->encoder->setNumElems(nrows_to_keep);
+      data_buffer->getEncoder()->setNumElems(nrows_to_keep);
       data_buffer->setSize(nbytes_var_data_to_keep);
       data_buffer->setUpdated();
 
@@ -1314,10 +1289,25 @@ void UpdelRoll::commitUpdate() {
   }
   const auto td = catalog->getMetadataForTable(logicalTableId);
   CHECK(td);
-  // checkpoint all shards regardless, or epoch becomes out of sync
-  if (td->persistenceLevel == Data_Namespace::MemoryLevel::DISK_LEVEL) {
-    catalog->checkpoint(logicalTableId);
+  ChunkKey chunk_key{catalog->getDatabaseId(), td->tableId};
+  const auto table_lock = lockmgr::TableDataLockMgr::getWriteLockForTable(chunk_key);
+
+  // Checkpoint all shards. Otherwise, epochs can go out of sync. Also, for distributed
+  // mode, do not checkpoint here, since the aggregator handles checkpointing.
+  if (!g_cluster && td->persistenceLevel == Data_Namespace::MemoryLevel::DISK_LEVEL) {
+    auto table_epochs = catalog->getTableEpochs(catalog->getDatabaseId(), logicalTableId);
+    try {
+      // `checkpointWithAutoRollback` is not called here because, if a failure occurs,
+      // `dirtyChunks` has to be cleared before resetting epochs
+      catalog->checkpoint(logicalTableId);
+    } catch (...) {
+      dirtyChunks.clear();
+      const_cast<Catalog_Namespace::Catalog*>(catalog)->setTableEpochsLogExceptions(
+          catalog->getDatabaseId(), table_epochs);
+      throw;
+    }
   }
+
   // for each dirty fragment
   for (auto& cm : chunkMetadata) {
     cm.first.first->fragmenter->updateMetadata(catalog, cm.first, *this);
@@ -1337,13 +1327,16 @@ void UpdelRoll::cancelUpdate() {
     return;
   }
 
+  // TODO: needed?
+  ChunkKey chunk_key{catalog->getDatabaseId(), logicalTableId};
+  const auto table_lock = lockmgr::TableDataLockMgr::getWriteLockForTable(chunk_key);
   if (is_varlen_update) {
-    int databaseId = catalog->getCurrentDB().dbId;
-    int32_t tableEpoch = catalog->getTableEpoch(databaseId, logicalTableId);
+    int databaseId = catalog->getDatabaseId();
+    auto table_epochs = catalog->getTableEpochs(databaseId, logicalTableId);
 
     dirtyChunks.clear();
-    const_cast<Catalog_Namespace::Catalog*>(catalog)->setTableEpoch(
-        databaseId, logicalTableId, tableEpoch);
+    const_cast<Catalog_Namespace::Catalog*>(catalog)->setTableEpochs(databaseId,
+                                                                     table_epochs);
   } else {
     const auto td = catalog->getMetadataForTable(logicalTableId);
     CHECK(td);

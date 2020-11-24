@@ -73,13 +73,17 @@ class MapDLeafHandler {
     CHECK(false);
   }
 
-  void execute_query_step(TStepResult& _return, const TPendingQuery& pending_query) {
+  void execute_query_step(TStepResult& _return,
+                          const TPendingQuery& pending_query,
+                          const TSubqueryId subquery_id) {
     CHECK(false);
   }
 
   void broadcast_serialized_rows(const TSerializedRows& serialized_rows,
                                  const TRowDescriptor& row_desc,
-                                 const TQueryId query_id) {
+                                 const TQueryId query_id,
+                                 const TSubqueryId subquery_id,
+                                 const bool is_final_subquery_result) {
     CHECK(false);
   }
 

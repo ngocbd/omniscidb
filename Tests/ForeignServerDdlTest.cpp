@@ -351,6 +351,55 @@ TEST_F(ForeignServerPrivilegesDdlTest, DropServerWithSpecificPrivilege) {
   assertNullForeignServer();
 }
 
+TEST_F(ForeignServerPrivilegesDdlTest, AlterServerWithoutPrivilege) {
+  createTestServer();
+  login("test_user", "test_pass");
+  queryAndAssertException(
+      "ALTER SERVER test_server SET FOREIGN DATA WRAPPER OMNISCI_PARQUET;",
+      "Exception: Server test_server can not be altered. User has no ALTER SERVER "
+      "privileges.");
+}
+
+TEST_F(ForeignServerPrivilegesDdlTest, AlterServerWithPrivilege) {
+  createTestServer();
+  sql("GRANT ALTER SERVER ON DATABASE omnisci TO test_user;");
+  login("test_user", "test_pass");
+  sql("ALTER SERVER test_server SET FOREIGN DATA WRAPPER OMNISCI_PARQUET;");
+  auto foreign_server = getCatalog().getForeignServerFromStorage("test_server");
+  ASSERT_EQ(foreign_server->data_wrapper_type, "OMNISCI_PARQUET");
+}
+
+TEST_F(ForeignServerPrivilegesDdlTest, AlterServerWithSpecificPrivilege) {
+  createTestServer();
+  sql("GRANT ALTER ON SERVER test_server TO test_user;");
+  login("test_user", "test_pass");
+  sql("ALTER SERVER test_server SET FOREIGN DATA WRAPPER OMNISCI_PARQUET;");
+  auto foreign_server = getCatalog().getForeignServerFromStorage("test_server");
+  ASSERT_EQ(foreign_server->data_wrapper_type, "OMNISCI_PARQUET");
+}
+
+TEST_F(ForeignServerPrivilegesDdlTest, GrantRevokeAlterServerWithPrivilege) {
+  createTestServer();
+  sql("GRANT ALTER SERVER ON DATABASE omnisci TO test_user;");
+  sql("REVOKE ALTER SERVER ON DATABASE omnisci FROM test_user;");
+  login("test_user", "test_pass");
+  queryAndAssertException(
+      "ALTER SERVER test_server SET FOREIGN DATA WRAPPER OMNISCI_PARQUET;",
+      "Exception: Server test_server can not be altered. User has no ALTER SERVER "
+      "privileges.");
+}
+
+TEST_F(ForeignServerPrivilegesDdlTest, GrantRevokeAlterServerWithSpecificPrivilege) {
+  createTestServer();
+  sql("GRANT ALTER ON SERVER test_server TO test_user;");
+  sql("REVOKE ALTER ON SERVER test_server FROM test_user;");
+  login("test_user", "test_pass");
+  queryAndAssertException(
+      "ALTER SERVER test_server SET FOREIGN DATA WRAPPER OMNISCI_PARQUET;",
+      "Exception: Server test_server can not be altered. User has no ALTER SERVER "
+      "privileges.");
+}
+
 TEST_F(ForeignServerPrivilegesDdlTest,
        DropServerWithSpecificPrivilegeRepeatedWithoutPrivilege) {
   createTestServer();
@@ -794,7 +843,7 @@ TEST_F(ShowForeignServerTest, SHOW_PRIVILEGE) {
 
 TEST_F(ShowForeignServerTest, BadTimestamp) {
   std::string query{"SHOW SERVERS WHERE created_at = 'test';"};
-  queryAndAssertException(query, "Exception: Invalid DATE/TIMESTAMP string test");
+  queryAndAssertException(query, "Exception: Invalid DATE/TIMESTAMP string (test)");
 }
 
 TEST_F(ShowForeignServerTest, BadQuery) {
@@ -1089,6 +1138,7 @@ TEST_F(AlterForeignServerTest, InvalidStorageType) {
   std::string error_message{
       "Exception: Invalid storage type value. Value must be one of the following: "
       "LOCAL_FILE."};
+
   queryAndAssertException(query, error_message);
   assertExpectedForeignServer(
       createExpectedForeignServer("test_server", "omnisci_csv", DEFAULT_OPTIONS));

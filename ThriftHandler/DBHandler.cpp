@@ -23,7 +23,6 @@
 
 #include "DBHandler.h"
 #include "DistributedLoader.h"
-#include "MapDServer.h"
 #include "QueryEngine/UDFCompiler.h"
 #include "TokenCompletionHints.h"
 
@@ -40,14 +39,17 @@
 
 #include "Catalog/Catalog.h"
 #include "Catalog/DdlCommandExecutor.h"
-#include "DataMgr/ForeignStorage/ArrowCsvForeignStorage.h"
+#include "DataMgr/ForeignStorage/ArrowForeignStorage.h"
 #include "DataMgr/ForeignStorage/DummyForeignStorage.h"
 #include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
 #include "DistributedHandler.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
-#include "ImportExport/GDAL.h"
+#include "Geospatial/GDAL.h"
+#include "Geospatial/Transforms.h"
+#include "Geospatial/Types.h"
 #include "ImportExport/Importer.h"
 #include "LockMgr/LockMgr.h"
+#include "OSDependent/omnisci_hostname.h"
 #include "Parser/ParserWrapper.h"
 #include "Parser/ReservedKeywords.h"
 #include "Parser/parser.h"
@@ -63,9 +65,6 @@
 #include "QueryEngine/TableOptimizer.h"
 #include "QueryEngine/ThriftSerializers.h"
 #include "Shared/StringTransform.h"
-#include "Shared/SysInfo.h"
-#include "Shared/geo_types.h"
-#include "Shared/geosupport.h"
 #include "Shared/import_helpers.h"
 #include "Shared/mapd_shared_mutex.h"
 #include "Shared/measure.h"
@@ -183,6 +182,7 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
                      const bool read_only,
                      const bool allow_loop_joins,
                      const bool enable_rendering,
+                     const bool renderer_use_vulkan_driver,
                      const bool enable_auto_clear_render_mem,
                      const int render_oom_retry_threshold,
                      const size_t render_mem_bytes,
@@ -200,12 +200,11 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
                      const bool enable_runtime_udf_registration,
                      const std::string& udf_filename,
                      const std::string& clang_path,
-                     const std::vector<std::string>& clang_options
+                     const std::vector<std::string>& clang_options,
 #ifdef ENABLE_GEOS
-                     ,
-                     const std::string& libgeos_so_filename
+                     const std::string& libgeos_so_filename,
 #endif
-                     )
+                     const DiskCacheConfig& disk_cache_config)
     : leaf_aggregator_(db_leaves)
     , string_leaves_(string_leaves)
     , base_data_path_(base_data_path)
@@ -258,14 +257,28 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
     total_reserved += render_mem_bytes;
   }
 
+  std::unique_ptr<CudaMgr_Namespace::CudaMgr> cuda_mgr;
+#ifdef HAVE_CUDA
+  if (!cpu_mode_only_ || is_rendering_enabled) {
+    try {
+      cuda_mgr = std::make_unique<CudaMgr_Namespace::CudaMgr>(num_gpus, start_gpu);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Unable to instantiate CudaMgr, falling back to CPU-only mode. "
+                 << e.what();
+      cpu_mode_only_ = true;
+      is_rendering_enabled = false;
+    }
+  }
+#endif  // HAVE_CUDA
+
   try {
     data_mgr_.reset(new Data_Namespace::DataMgr(data_path.string(),
                                                 system_parameters,
+                                                std::move(cuda_mgr),
                                                 !cpu_mode_only_,
-                                                num_gpus,
-                                                start_gpu,
                                                 total_reserved,
-                                                num_reader_threads));
+                                                num_reader_threads,
+                                                disk_cache_config));
   } catch (const std::exception& e) {
     LOG(FATAL) << "Failed to initialize data manager: " << e.what();
   }
@@ -349,6 +362,7 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
                                               render_compositor_use_last_gpu,
                                               false,
                                               0,
+                                              false,
                                               system_parameters_));
     } catch (const std::exception& e) {
       LOG(ERROR) << "Backend rendering disabled: " << e.what();
@@ -446,8 +460,7 @@ void DBHandler::removeInMemoryCalciteSession(const std::string& session_id) {
 void DBHandler::internal_connect(TSessionId& session,
                                  const std::string& username,
                                  const std::string& dbname) {
-  auto stdlog = STDLOG();  // session_info set by connect_impl()
-  mapd_lock_guard<mapd_shared_mutex> write_lock(sessions_mutex_);
+  auto stdlog = STDLOG();            // session_info set by connect_impl()
   std::string username2 = username;  // login() may reset username given as argument
   std::string dbname2 = dbname;      // login() may reset dbname given as argument
   Catalog_Namespace::UserMetadata user_meta;
@@ -483,7 +496,6 @@ void DBHandler::connect(TSessionId& session,
                         const std::string& dbname) {
   auto stdlog = STDLOG();  // session_info set by connect_impl()
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
-  mapd_lock_guard<mapd_shared_mutex> write_lock(sessions_mutex_);
   std::string username2 = username;  // login() may reset username given as argument
   std::string dbname2 = dbname;      // login() may reset dbname given as argument
   Catalog_Namespace::UserMetadata user_meta;
@@ -539,20 +551,24 @@ void DBHandler::connect_impl(TSessionId& session,
   // TODO(sy): Is there any reason to have dbname as a parameter
   // here when the cat parameter already provides cat->name()?
   // Should dbname and cat->name() ever differ?
-  auto session_ptr = create_new_session(session, dbname, user_meta, cat);
-  stdlog.setSessionInfo(session_ptr);
-  session_ptr->set_connection_info(getConnectionInfo().toString());
-  if (!super_user_rights_) {  // no need to connect to leaf_aggregator_ at this time while
-                              // doing warmup
-    if (leaf_aggregator_.leafCount() > 0) {
-      leaf_aggregator_.connect(*session_ptr, user_meta.userName, passwd, dbname);
-      return;
+  {
+    mapd_lock_guard<mapd_shared_mutex> write_lock(sessions_mutex_);
+    auto session_ptr = create_new_session(session, dbname, user_meta, cat);
+    stdlog.setSessionInfo(session_ptr);
+    session_ptr->set_connection_info(getConnectionInfo().toString());
+    if (!super_user_rights_) {  // no need to connect to leaf_aggregator_ at this time
+                                // while doing warmup
+      if (leaf_aggregator_.leafCount() > 0) {
+        leaf_aggregator_.connect(*session_ptr, user_meta.userName, passwd, dbname);
+        return;
+      }
     }
   }
-  auto const roles = session_ptr->get_currentUser().isSuper
-                         ? std::vector<std::string>{{"super"}}
-                         : SysCatalog::instance().getRoles(
-                               false, false, session_ptr->get_currentUser().userName);
+  auto const roles =
+      stdlog.getConstSessionInfo()->get_currentUser().isSuper
+          ? std::vector<std::string>{{"super"}}
+          : SysCatalog::instance().getRoles(
+                false, false, stdlog.getConstSessionInfo()->get_currentUser().userName);
   stdlog.appendNameValuePairs("roles", boost::algorithm::join(roles, ","));
 }
 
@@ -675,7 +691,7 @@ void DBHandler::get_server_status(TServerStatus& _return, const TSessionId& sess
   _return.poly_rendering_enabled = rendering_enabled;
   _return.start_time = start_time_;
   _return.edition = MAPD_EDITION;
-  _return.host_name = get_hostname();
+  _return.host_name = omnisci::get_hostname();
 }
 
 void DBHandler::get_status(std::vector<TServerStatus>& _return,
@@ -690,7 +706,7 @@ void DBHandler::get_status(std::vector<TServerStatus>& _return,
   ret.poly_rendering_enabled = rendering_enabled;
   ret.start_time = start_time_;
   ret.edition = MAPD_EDITION;
-  ret.host_name = get_hostname();
+  ret.host_name = omnisci::get_hostname();
 
   // TSercivePort tcp_port{}
 
@@ -809,6 +825,7 @@ void DBHandler::value_to_thrift_column(const TargetValue& tv,
       }
     }
   } else {
+    CHECK(!ti.is_column());
     const auto scalar_tv = boost::get<ScalarTargetValue>(&tv);
     CHECK(scalar_tv);
     if (boost::get<int64_t>(scalar_tv)) {
@@ -981,6 +998,7 @@ void DBHandler::sql_execute(TQueryResult& _return,
   auto query_state = create_query_state(session_ptr, query_str);
   auto stdlog = STDLOG(session_ptr, query_state);
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  stdlog.appendNameValuePairs("nonce", nonce);
   auto timer = DEBUG_TIMER(__func__);
 
   try {
@@ -1079,7 +1097,8 @@ void DBHandler::sql_execute_df(TDataFrame& _return,
                                const std::string& query_str,
                                const TDeviceType::type device_type,
                                const int32_t device_id,
-                               const int32_t first_n) {
+                               const int32_t first_n,
+                               const TArrowTransport::type transport_method) {
   auto session_ptr = get_session_ptr(session);
   auto query_state = create_query_state(session_ptr, query_str);
   auto stdlog = STDLOG(session_ptr, query_state);
@@ -1130,7 +1149,8 @@ void DBHandler::sql_execute_df(TDataFrame& _return,
                          device_type == TDeviceType::CPU ? ExecutorDeviceType::CPU
                                                          : ExecutorDeviceType::GPU,
                          static_cast<size_t>(device_id),
-                         first_n);
+                         first_n,
+                         transport_method);
       return;
     }
   } catch (std::exception& e) {
@@ -1146,7 +1166,13 @@ void DBHandler::sql_execute_gdf(TDataFrame& _return,
                                 const int32_t device_id,
                                 const int32_t first_n) {
   auto stdlog = STDLOG(get_session_ptr(session));
-  sql_execute_df(_return, session, query_str, TDeviceType::GPU, device_id, first_n);
+  sql_execute_df(_return,
+                 session,
+                 query_str,
+                 TDeviceType::GPU,
+                 device_id,
+                 first_n,
+                 TArrowTransport::SHARED_MEMORY);
 }
 
 // For now we have only one user of a data frame in all cases.
@@ -1198,17 +1224,38 @@ std::string DBHandler::apply_copy_to_shim(const std::string& query_str) {
 void DBHandler::sql_validate(TRowDescriptor& _return,
                              const TSessionId& session,
                              const std::string& query_str) {
-  auto stdlog = STDLOG(get_session_ptr(session));
-  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
-  auto query_state = create_query_state(stdlog.getSessionInfo(), query_str);
-  stdlog.setQueryState(query_state);
+  try {
+    auto stdlog = STDLOG(get_session_ptr(session));
+    stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+    auto query_state = create_query_state(stdlog.getSessionInfo(), query_str);
+    stdlog.setQueryState(query_state);
 
-  ParserWrapper pw{query_str};
-  if ((pw.getExplainType() != ParserWrapper::ExplainType::None) || pw.is_ddl ||
-      pw.is_update_dml) {
-    THROW_MAPD_EXCEPTION("Can only validate SELECT statements.");
+    ParserWrapper pw{query_str};
+    if ((pw.getExplainType() != ParserWrapper::ExplainType::None) || pw.is_ddl ||
+        pw.is_update_dml) {
+      throw std::runtime_error("Can only validate SELECT statements.");
+    }
+
+    const auto execute_read_lock = mapd_shared_lock<mapd_shared_mutex>(
+        *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
+            legacylockmgr::ExecutorOuterLock, true));
+
+    TPlanResult parse_result;
+    lockmgr::LockedTableDescriptors locks;
+    std::tie(parse_result, locks) = parse_to_ra(query_state->createQueryStateProxy(),
+                                                query_state->getQueryStr(),
+                                                {},
+                                                true,
+                                                system_parameters_,
+                                                /*check_privileges=*/true);
+    const auto query_ra = parse_result.plan_result;
+
+    const auto result = validate_rel_alg(query_ra, query_state->createQueryStateProxy());
+    _return = fixup_row_descriptor(result.row_set.row_desc,
+                                   query_state->getConstSessionInfo()->getCatalog());
+  } catch (const std::exception& e) {
+    THROW_MAPD_EXCEPTION("Exception: " + std::string(e.what()));
   }
-  DBHandler::validate_rel_alg(_return, query_state->createQueryStateProxy());
 }
 
 namespace {
@@ -1401,43 +1448,28 @@ std::unordered_set<std::string> DBHandler::get_uc_compatible_table_names_by_colu
   return compatible_table_names_by_column;
 }
 
-void DBHandler::validate_rel_alg(TRowDescriptor& _return,
-                                 QueryStateProxy query_state_proxy) {
-  try {
-    const auto execute_read_lock = mapd_shared_lock<mapd_shared_mutex>(
-        *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
-            legacylockmgr::ExecutorOuterLock, true));
-
-    // TODO(adb): for a validate query we do not need write locks, though the lock would
-    // generally be short lived.
-    TPlanResult parse_result;
-    lockmgr::LockedTableDescriptors locks;
-    std::tie(parse_result, locks) =
-        parse_to_ra(query_state_proxy,
-                    query_state_proxy.getQueryState().getQueryStr(),
-                    {},
-                    true,
-                    system_parameters_);
-    const auto query_ra = parse_result.plan_result;
-
-    TQueryResult result;
-    DBHandler::execute_rel_alg(result,
-                               query_state_proxy,
-                               query_ra,
-                               true,
-                               ExecutorDeviceType::CPU,
-                               -1,
-                               -1,
-                               /*just_validate=*/true,
-                               /*find_filter_push_down_candidates=*/false,
-                               ExplainInfo::defaults());
-
-    _return = fixup_row_descriptor(
-        result.row_set.row_desc,
-        query_state_proxy.getQueryState().getConstSessionInfo()->getCatalog());
-  } catch (std::exception& e) {
-    THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
-  }
+TQueryResult DBHandler::validate_rel_alg(const std::string& query_ra,
+                                         QueryStateProxy query_state_proxy) {
+  TQueryResult result;
+  auto execute_rel_alg_task = std::make_shared<QueryDispatchQueue::Task>(
+      [this, &result, &query_state_proxy, &query_ra](const size_t executor_index) {
+        execute_rel_alg(result,
+                        query_state_proxy,
+                        query_ra,
+                        true,
+                        ExecutorDeviceType::CPU,
+                        -1,
+                        -1,
+                        /*just_validate=*/true,
+                        /*find_filter_push_down_candidates=*/false,
+                        ExplainInfo::defaults(),
+                        executor_index);
+      });
+  CHECK(dispatch_queue_);
+  dispatch_queue_->submit(execute_rel_alg_task, /*is_update_delete=*/false);
+  auto result_future = execute_rel_alg_task->get_future();
+  result_future.get();
+  return result;
 }
 
 void DBHandler::get_roles(std::vector<std::string>& roles, const TSessionId& session) {
@@ -1860,17 +1892,6 @@ void DBHandler::get_result_row_for_pixel(
   }
 }
 
-namespace {
-
-inline void fixup_geo_column_descriptor(TColumnType& col_type,
-                                        const SQLTypes subtype,
-                                        const int output_srid) {
-  col_type.col_type.precision = static_cast<int>(subtype);
-  col_type.col_type.scale = output_srid;
-}
-
-}  // namespace
-
 TColumnType DBHandler::populateThriftColumnType(const Catalog* cat,
                                                 const ColumnDescriptor* cd) {
   TColumnType col_type;
@@ -1885,7 +1906,7 @@ TColumnType DBHandler::populateThriftColumnType(const Catalog* cat,
     col_type.col_type.size = cd->columnType.get_size();  // only for arrays and dates
   }
   if (IS_GEO(cd->columnType.get_type())) {
-    fixup_geo_column_descriptor(
+    ThriftSerializers::fixup_geo_column_descriptor(
         col_type, cd->columnType.get_subtype(), cd->columnType.get_output_srid());
   } else {
     col_type.col_type.precision = cd->columnType.get_precision();
@@ -1966,17 +1987,9 @@ void DBHandler::get_table_details_impl(TTableDetails& _return,
             have_privileges_on_view_sources = false;
           }
 
-          TQueryResult result;
-          execute_rel_alg(result,
-                          query_state->createQueryStateProxy(),
-                          query_ra.first.plan_result,
-                          true,
-                          ExecutorDeviceType::CPU,
-                          -1,
-                          -1,
-                          /*just_validate=*/true,
-                          /*find_filter_push_down_candidates=*/false,
-                          ExplainInfo::defaults());
+          const auto result = validate_rel_alg(query_ra.first.plan_result,
+                                               query_state->createQueryStateProxy());
+
           _return.row_desc = fixup_row_descriptor(result.row_set.row_desc, cat);
         } else {
           throw std::runtime_error(
@@ -2291,7 +2304,7 @@ void DBHandler::get_memory(std::vector<TNodeMemoryInfo>& _return,
   for (auto memInfo : internal_memory) {
     TNodeMemoryInfo nodeInfo;
     if (leaf_aggregator_.leafCount() > 0) {
-      nodeInfo.host_name = get_hostname();
+      nodeInfo.host_name = omnisci::get_hostname();
     }
     nodeInfo.page_size = memInfo.pageSize;
     nodeInfo.max_num_pages = memInfo.maxNumPages;
@@ -2512,19 +2525,20 @@ void DBHandler::load_table_binary_columnar(const TSessionId& session,
       // For geometry columns: process WKT strings and fill physical columns
       if (cd->columnType.is_geometry()) {
         auto geo_col_idx = col_idx - 1;
-        const auto wkt_column = import_buffers[geo_col_idx]->getGeoStringBuffer();
+        const auto wkt_or_wkb_hex_column =
+            import_buffers[geo_col_idx]->getGeoStringBuffer();
         std::vector<std::vector<double>> coords_column, bounds_column;
         std::vector<std::vector<int>> ring_sizes_column, poly_rings_column;
         int render_group = 0;
         SQLTypeInfo ti = cd->columnType;
-        if (numRows != wkt_column->size() ||
-            !Geo_namespace::GeoTypesFactory::getGeoColumns(wkt_column,
-                                                           ti,
-                                                           coords_column,
-                                                           bounds_column,
-                                                           ring_sizes_column,
-                                                           poly_rings_column,
-                                                           false)) {
+        if (numRows != wkt_or_wkb_hex_column->size() ||
+            !Geospatial::GeoTypesFactory::getGeoColumns(wkt_or_wkb_hex_column,
+                                                        ti,
+                                                        coords_column,
+                                                        bounds_column,
+                                                        ring_sizes_column,
+                                                        poly_rings_column,
+                                                        false)) {
           std::ostringstream oss;
           oss << "load_table_binary_columnar: Invalid geometry in column "
               << cd->columnName;
@@ -2580,8 +2594,8 @@ RecordBatchVector loadArrowStream(const std::string& stream) {
 
     arrow::io::BufferReader buf_reader(stream_buffer);
     std::shared_ptr<arrow::RecordBatchReader> batch_reader;
-    ARROW_THRIFT_THROW_NOT_OK(
-        arrow::ipc::RecordBatchStreamReader::Open(&buf_reader, &batch_reader));
+    ARROW_ASSIGN_OR_THROW(batch_reader,
+                          arrow::ipc::RecordBatchStreamReader::Open(&buf_reader));
 
     while (true) {
       std::shared_ptr<arrow::RecordBatch> batch;
@@ -2718,10 +2732,10 @@ void DBHandler::load_table(const TSessionId& session,
             std::vector<double> coords, bounds;
             std::vector<int> ring_sizes, poly_rings;
             int render_group = 0;
-            SQLTypeInfo ti;
-            if (row.cols[import_idx].is_null ||
-                !Geo_namespace::GeoTypesFactory::getGeoColumns(
-                    row.cols[import_idx].str_val,
+            SQLTypeInfo ti{cd->columnType};
+            if (!Geospatial::GeoTypesFactory::getGeoColumns(
+                    !row.cols[import_idx].is_null ? row.cols[import_idx].str_val
+                                                  : std::string(),
                     ti,
                     coords,
                     bounds,
@@ -2968,9 +2982,10 @@ TCopyParams DBHandler::copyparams_to_thrift(const import_export::CopyParams& cp)
   return copy_params;
 }
 
+namespace {
 void add_vsi_network_prefix(std::string& path) {
   // do we support network file access?
-  bool gdal_network = import_export::GDAL::supportsNetworkFileAccess();
+  bool gdal_network = Geospatial::GDAL::supportsNetworkFileAccess();
 
   // modify head of filename based on source location
   if (boost::istarts_with(path, "http://") || boost::istarts_with(path, "https://")) {
@@ -3113,6 +3128,19 @@ std::string find_first_geo_file_in_archive(const std::string& archive_path,
   return file_name;
 }
 
+bool is_local_file(const std::string& file_path) {
+  return (!boost::istarts_with(file_path, "s3://") &&
+          !boost::istarts_with(file_path, "http://") &&
+          !boost::istarts_with(file_path, "https://"));
+}
+
+void validate_import_file_path_if_local(const std::string& file_path) {
+  if (is_local_file(file_path)) {
+    ddl_utils::validate_allowed_file_path(file_path, ddl_utils::DataTransferType::IMPORT);
+  }
+}
+}  // namespace
+
 void DBHandler::detect_column_types(TDetectResult& _return,
                                     const TSessionId& session,
                                     const std::string& file_name_in,
@@ -3124,13 +3152,13 @@ void DBHandler::detect_column_types(TDetectResult& _return,
   import_export::CopyParams copy_params = thrift_to_copyparams(cp);
 
   std::string file_name{file_name_in};
-
   if (path_is_relative(file_name)) {
     // assume relative paths are relative to data_path / mapd_import / <session>
     auto file_path = import_path_ / picosha2::hash256_hex_string(session) /
                      boost::filesystem::path(file_name).filename();
     file_name = file_path.string();
   }
+  validate_import_file_path_if_local(file_name);
 
   // if it's a geo table, handle alternative paths (S3, HTTP, archive etc.)
   if (copy_params.file_type == import_export::FileType::POLYGON) {
@@ -3178,6 +3206,7 @@ void DBHandler::detect_column_types(TDetectResult& _return,
       }
     }
   }
+
   try {
     if (copy_params.file_type == import_export::FileType::DELIMITED
 #ifdef ENABLE_IMPORT_PARQUET
@@ -3280,6 +3309,7 @@ void DBHandler::render_vega(TRenderResult& _return,
                        "nonce",
                        nonce);
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  stdlog.appendNameValuePairs("nonce", nonce);
   auto session_ptr = stdlog.getConstSessionInfo();
   if (!render_handler_) {
     THROW_MAPD_EXCEPTION("Backend rendering is disabled.");
@@ -3817,6 +3847,7 @@ void DBHandler::import_table(const TSessionId& session,
     auto session_ptr = stdlog.getConstSessionInfo();
     check_read_only("import_table");
     LOG(INFO) << "import_table " << table_name << " from " << file_name_in;
+
     auto& cat = session_ptr->getCatalog();
     const auto td_with_lock =
         lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>::acquireTableDescriptor(
@@ -3838,6 +3869,7 @@ void DBHandler::import_table(const TSessionId& session,
         THROW_MAPD_EXCEPTION("File does not exist: " + file_path.string());
       }
     }
+    validate_import_file_path_if_local(file_name);
 
     // TODO(andrew): add delimiter detection to Importer
     if (copy_params.delimiter == '\0') {
@@ -3939,6 +3971,7 @@ void DBHandler::import_geo_table(const TSessionId& session,
                      boost::filesystem::path(file_name).filename();
     file_name = file_path.string();
   }
+  validate_import_file_path_if_local(file_name);
 
   if (is_a_supported_geo_file(file_name, true)) {
     // prepare to load geo file directly
@@ -4385,6 +4418,7 @@ void DBHandler::get_first_geo_file_in_archive(std::string& _return,
   auto stdlog =
       STDLOG(get_session_ptr(session), "get_first_geo_file_in_archive", archive_path_in);
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+
   std::string archive_path(archive_path_in);
 
   if (path_is_relative(archive_path)) {
@@ -4393,6 +4427,7 @@ void DBHandler::get_first_geo_file_in_archive(std::string& _return,
                      boost::filesystem::path(archive_path).filename();
     archive_path = file_path.string();
   }
+  validate_import_file_path_if_local(archive_path);
 
   if (is_a_supported_archive_file(archive_path)) {
     // find the archive file
@@ -4434,6 +4469,7 @@ void DBHandler::get_all_files_in_archive(std::vector<std::string>& _return,
                      boost::filesystem::path(archive_path).filename();
     archive_path = file_path.string();
   }
+  validate_import_file_path_if_local(archive_path);
 
   if (is_a_supported_archive_file(archive_path)) {
     // find the archive file
@@ -4459,6 +4495,7 @@ void DBHandler::get_layers_in_geo_file(std::vector<TGeoFileLayerInfo>& _return,
                                        const TCopyParams& cp) {
   auto stdlog = STDLOG(get_session_ptr(session), "get_layers_in_geo_file", file_name_in);
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+
   std::string file_name(file_name_in);
 
   import_export::CopyParams copy_params = thrift_to_copyparams(cp);
@@ -4470,6 +4507,7 @@ void DBHandler::get_layers_in_geo_file(std::vector<TGeoFileLayerInfo>& _return,
                      boost::filesystem::path(file_name).filename();
     file_name = file_path.string();
   }
+  validate_import_file_path_if_local(file_name);
 
   // validate file_name
   if (is_a_supported_geo_file(file_name, true)) {
@@ -4728,7 +4766,7 @@ std::vector<PushedDownFilterInfo> DBHandler::execute_rel_alg(
                          explain_info.justCalciteExplain(),
                          system_parameters_.gpu_input_mem_limit,
                          g_enable_runtime_query_interrupt,
-                         g_runtime_query_interrupt_frequency};
+                         g_pending_query_interrupt_freq};
   ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
                                                      ExecutorDeviceType::CPU,
                                                      QueryMemoryDescriptor(),
@@ -4765,7 +4803,8 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                                    const Catalog_Namespace::SessionInfo& session_info,
                                    const ExecutorDeviceType device_type,
                                    const size_t device_id,
-                                   const int32_t first_n) const {
+                                   const int32_t first_n,
+                                   const TArrowTransport::type transport_method) const {
   const auto& cat = session_info.getCatalog();
   CHECK(device_type == ExecutorDeviceType::CPU ||
         session_info.get_executor_device_type() == ExecutorDeviceType::GPU);
@@ -4799,7 +4838,7 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                          false,
                          system_parameters_.gpu_input_mem_limit,
                          g_enable_runtime_query_interrupt,
-                         g_runtime_query_interrupt_frequency};
+                         g_pending_query_interrupt_freq};
   ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
                                                      ExecutorDeviceType::CPU,
                                                      QueryMemoryDescriptor(),
@@ -4816,7 +4855,8 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                                                 device_type,
                                                 device_id,
                                                 getTargetNames(result.getTargetsMeta()),
-                                                first_n);
+                                                first_n,
+                                                ArrowTransport(transport_method));
   ArrowResult arrow_result;
   _return.arrow_conversion_time_ms +=
       measure<>::execution([&] { arrow_result = converter->getArrowResult(); });
@@ -4825,6 +4865,8 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
   _return.sm_size = arrow_result.sm_size;
   _return.df_handle =
       std::string(arrow_result.df_handle.begin(), arrow_result.df_handle.end());
+  _return.df_buffer =
+      std::string(arrow_result.df_buffer.begin(), arrow_result.df_buffer.end());
   if (device_type == ExecutorDeviceType::GPU) {
     std::lock_guard<std::mutex> map_lock(handle_to_dev_ptr_mutex_);
     CHECK(!ipc_handle_to_dev_ptr_.count(_return.df_handle));
@@ -4865,56 +4907,15 @@ std::vector<std::string> DBHandler::getTargetNames(
   return names;
 }
 
-TColumnType DBHandler::convert_target_metainfo(const TargetMetaInfo& target,
-                                               const size_t idx) const {
-  TColumnType proj_info;
-  proj_info.col_name = target.get_resname();
-  if (proj_info.col_name.empty()) {
-    proj_info.col_name = "result_" + std::to_string(idx + 1);
-  }
-  const auto& target_ti = target.get_type_info();
-  proj_info.col_type.type = type_to_thrift(target_ti);
-  proj_info.col_type.encoding = encoding_to_thrift(target_ti);
-  proj_info.col_type.nullable = !target_ti.get_notnull();
-  proj_info.col_type.is_array = target_ti.get_type() == kARRAY;
-  if (IS_GEO(target_ti.get_type())) {
-    fixup_geo_column_descriptor(
-        proj_info, target_ti.get_subtype(), target_ti.get_output_srid());
-  } else {
-    proj_info.col_type.precision = target_ti.get_precision();
-    proj_info.col_type.scale = target_ti.get_scale();
-  }
-  if (target_ti.get_type() == kDATE) {
-    proj_info.col_type.size = target_ti.get_size();
-  }
-  proj_info.col_type.comp_param =
-      (target_ti.is_date_in_days() && target_ti.get_comp_param() == 0)
-          ? 32
-          : target_ti.get_comp_param();
-  return proj_info;
-}
-
-TRowDescriptor DBHandler::convert_target_metainfo(
-    const std::vector<TargetMetaInfo>& targets) const {
-  TRowDescriptor row_desc;
-  size_t i = 0;
-  for (const auto& target : targets) {
-    row_desc.push_back(convert_target_metainfo(target, i));
-    ++i;
-  }
-  return row_desc;
-}
-
-template <class R>
 void DBHandler::convert_rows(TQueryResult& _return,
                              QueryStateProxy query_state_proxy,
                              const std::vector<TargetMetaInfo>& targets,
-                             const R& results,
+                             const ResultSet& results,
                              const bool column_format,
                              const int32_t first_n,
                              const int32_t at_most_n) const {
   query_state::Timer timer = query_state_proxy.createTimer(__func__);
-  _return.row_set.row_desc = convert_target_metainfo(targets);
+  _return.row_set.row_desc = ThriftSerializers::target_meta_infos_to_thrift(targets);
   int32_t fetched{0};
   if (column_format) {
     _return.row_set.is_columnar = true;
@@ -5077,7 +5078,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
 
   _return.nonce = nonce;
   _return.execution_time_ms = 0;
-  auto const& query_str = query_state_proxy.getQueryState().getQueryStr();
+  auto const query_str = strip(query_state_proxy.getQueryState().getQueryStr());
   auto session_ptr = query_state_proxy.getQueryState().getConstSessionInfo();
   // Call to DistributedValidate() below may change cat.
   auto& cat = session_ptr->getCatalog();
@@ -5117,6 +5118,20 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
     }
   }
   if (pw.isCalcitePathPermissable(read_only_)) {
+    // run DDL before the locks as DDL statements should handle their own locking
+    if (pw.isCalciteDdl()) {
+      std::string query_ra;
+      _return.execution_time_ms += measure<>::execution([&]() {
+        TPlanResult result;
+        std::tie(result, locks) =
+            parse_to_ra(query_state_proxy, query_str, {}, false, system_parameters_);
+        query_ra = result.plan_result;
+      });
+
+      executeDdl(_return, query_ra, session_ptr);
+      return;
+    }
+
     executeReadLock = mapd_shared_lock<mapd_shared_mutex>(
         *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
             legacylockmgr::ExecutorOuterLock, true));
@@ -5143,9 +5158,6 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
       query_ra_calcite_explain =
           parse_to_ra(query_state_proxy, temp_query_str, {}, false, system_parameters_)
               .first.plan_result;
-    } else if (pw.isCalciteDdl()) {
-      executeDdl(_return, query_ra, session_ptr);
-      return;
     }
     const auto explain_info = pw.getExplainInfo();
     std::vector<PushedDownFilterInfo> filter_push_down_requests;
@@ -5205,7 +5217,9 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
           }
         });
     CHECK(dispatch_queue_);
-    dispatch_queue_->submit(execute_rel_alg_task);
+    dispatch_queue_->submit(execute_rel_alg_task,
+                            pw.getDMLType() == ParserWrapper::DMLType::Update ||
+                                pw.getDMLType() == ParserWrapper::DMLType::Delete);
     auto result_future = execute_rel_alg_task->get_future();
     result_future.get();
     return;
@@ -5486,29 +5500,25 @@ std::pair<TPlanResult, lockmgr::LockedTableDescriptors> DBHandler::parse_to_ra(
                     result.resolved_accessed_objects.tables_deleted_from.begin(),
                     result.resolved_accessed_objects.tables_deleted_from.end());
       // avoid deadlocks by enforcing a deterministic locking sequence
+      // first, obtain table schema locks
+      // then, obtain table data locks
       std::sort(tables.begin(), tables.end());
       for (const auto& table : tables) {
-        // first, obtain table schema locks
-        // then, obtain table data locks
+        locks.emplace_back(
+            std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>>(
+                lockmgr::TableSchemaLockContainer<
+                    lockmgr::ReadLock>::acquireTableDescriptor(*cat.get(), table)));
         if (read_only_tables.count(table)) {
-          locks.emplace_back(
-              std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>>(
-                  lockmgr::TableSchemaLockContainer<
-                      lockmgr::ReadLock>::acquireTableDescriptor(*cat.get(), table)));
           locks.emplace_back(
               std::make_unique<lockmgr::TableDataLockContainer<lockmgr::ReadLock>>(
                   lockmgr::TableDataLockContainer<lockmgr::ReadLock>::acquire(
                       cat->getDatabaseId(), (*locks.back())())));
         } else {
+          // Aquire an insert data lock for updates/deletes, consistent w/ insert. The
+          // table data lock will be aquired in the fragmenter during checkpoint.
           locks.emplace_back(
-              std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>>(
-                  lockmgr::TableSchemaLockContainer<
-                      lockmgr::WriteLock>::acquireTableDescriptor(*cat.get(), table)));
-          // TODO(adb): Should we be taking this lock for inserts? Are inserts even
-          // going down this path?
-          locks.emplace_back(
-              std::make_unique<lockmgr::TableDataLockContainer<lockmgr::WriteLock>>(
-                  lockmgr::TableDataLockContainer<lockmgr::WriteLock>::acquire(
+              std::make_unique<lockmgr::TableInsertLockContainer<lockmgr::WriteLock>>(
+                  lockmgr::TableInsertLockContainer<lockmgr::WriteLock>::acquire(
                       cat->getDatabaseId(), (*locks.back())())));
         }
       }
@@ -5574,14 +5584,15 @@ void DBHandler::start_query(TPendingQuery& _return,
 }
 
 void DBHandler::execute_query_step(TStepResult& _return,
-                                   const TPendingQuery& pending_query) {
+                                   const TPendingQuery& pending_query,
+                                   const TSubqueryId subquery_id) {
   if (!leaf_handler_) {
     THROW_MAPD_EXCEPTION("Distributed support is disabled.");
   }
   LOG(INFO) << "execute_query_step :  id:" << pending_query.id;
   auto time_ms = measure<>::execution([&]() {
     try {
-      leaf_handler_->execute_query_step(_return, pending_query);
+      leaf_handler_->execute_query_step(_return, pending_query, subquery_id);
     } catch (std::exception& e) {
       THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
     }
@@ -5591,14 +5602,17 @@ void DBHandler::execute_query_step(TStepResult& _return,
 
 void DBHandler::broadcast_serialized_rows(const TSerializedRows& serialized_rows,
                                           const TRowDescriptor& row_desc,
-                                          const TQueryId query_id) {
+                                          const TQueryId query_id,
+                                          const TSubqueryId subquery_id,
+                                          const bool is_final_subquery_result) {
   if (!leaf_handler_) {
     THROW_MAPD_EXCEPTION("Distributed support is disabled.");
   }
   LOG(INFO) << "BROADCAST-SERIALIZED-ROWS  id:" << query_id;
   auto time_ms = measure<>::execution([&]() {
     try {
-      leaf_handler_->broadcast_serialized_rows(serialized_rows, row_desc, query_id);
+      leaf_handler_->broadcast_serialized_rows(
+          serialized_rows, row_desc, query_id, subquery_id, is_final_subquery_result);
     } catch (std::exception& e) {
       THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
     }
@@ -5738,13 +5752,11 @@ void DBHandler::execute_next_render_step(TRenderStepResult& _return,
             << ", time: " << time_ms << "ms ";
 }
 
-void DBHandler::checkpoint(const TSessionId& session,
-                           const int32_t db_id,
-                           const int32_t table_id) {
+void DBHandler::checkpoint(const TSessionId& session, const int32_t table_id) {
   auto stdlog = STDLOG(get_session_ptr(session));
   auto session_ptr = stdlog.getConstSessionInfo();
   auto& cat = session_ptr->getCatalog();
-  cat.getDataMgr().checkpoint(db_id, table_id);
+  cat.checkpoint(table_id);
 }
 
 // check and reset epoch if a request has been made
@@ -5818,6 +5830,59 @@ int32_t DBHandler::get_table_epoch_by_name(const TSessionId& session,
   return cat.getTableEpoch(db_id, td->tableId);
 }
 
+void DBHandler::get_table_epochs(std::vector<TTableEpochInfo>& _return,
+                                 const TSessionId& session,
+                                 const int32_t db_id,
+                                 const int32_t table_id) {
+  auto stdlog = STDLOG(get_session_ptr(session));
+  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  auto session_ptr = stdlog.getConstSessionInfo();
+  auto const& cat = session_ptr->getCatalog();
+
+  std::vector<Catalog_Namespace::TableEpochInfo> table_epochs;
+  if (leaf_aggregator_.leafCount() > 0) {
+    table_epochs = leaf_aggregator_.getLeafTableEpochs(*session_ptr, db_id, table_id);
+  } else {
+    table_epochs = cat.getTableEpochs(db_id, table_id);
+  }
+  CHECK(!table_epochs.empty());
+
+  for (const auto& table_epoch : table_epochs) {
+    TTableEpochInfo table_epoch_info;
+    table_epoch_info.table_id = table_epoch.table_id;
+    table_epoch_info.table_epoch = table_epoch.table_epoch;
+    table_epoch_info.leaf_index = table_epoch.leaf_index;
+    _return.emplace_back(table_epoch_info);
+  }
+}
+
+void DBHandler::set_table_epochs(const TSessionId& session,
+                                 const int32_t db_id,
+                                 const std::vector<TTableEpochInfo>& table_epochs) {
+  auto stdlog = STDLOG(get_session_ptr(session));
+  stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+  auto session_ptr = stdlog.getConstSessionInfo();
+
+  // Only super users are allowed to call this API on a single node instance
+  // or aggregator (for distributed mode)
+  if (!g_cluster || leaf_aggregator_.leafCount() > 0) {
+    if (!session_ptr->get_currentUser().isSuper) {
+      THROW_MAPD_EXCEPTION("Only super users can set table epochs");
+    }
+  }
+  std::vector<Catalog_Namespace::TableEpochInfo> table_epochs_vector;
+  for (const auto& table_epoch : table_epochs) {
+    table_epochs_vector.emplace_back(
+        table_epoch.table_id, table_epoch.table_epoch, table_epoch.leaf_index);
+  }
+  if (leaf_aggregator_.leafCount() > 0) {
+    leaf_aggregator_.setLeafTableEpochs(*session_ptr, db_id, table_epochs_vector);
+  } else {
+    auto& cat = session_ptr->getCatalog();
+    cat.setTableEpochs(db_id, table_epochs_vector);
+  }
+}
+
 void DBHandler::set_license_key(TLicenseInfo& _return,
                                 const TSessionId& session,
                                 const std::string& key,
@@ -5850,7 +5915,7 @@ void DBHandler::emergency_shutdown() {
   }
 }
 
-extern std::map<std::string, std::string> get_device_parameters();
+extern std::map<std::string, std::string> get_device_parameters(bool cpu_only);
 
 #define EXPOSE_THRIFT_MAP(TYPENAME)                                             \
   {                                                                             \
@@ -5866,7 +5931,7 @@ extern std::map<std::string, std::string> get_device_parameters();
 void DBHandler::get_device_parameters(std::map<std::string, std::string>& _return,
                                       const TSessionId& session) {
   const auto session_info = get_session_copy(session);
-  auto params = ::get_device_parameters();
+  auto params = ::get_device_parameters(cpu_mode_only_);
   for (auto item : params) {
     _return.insert(item);
   }
@@ -5954,12 +6019,12 @@ ExtArgumentType mapfrom(const TExtArgumentType::type& t) {
 
 table_functions::OutputBufferSizeType mapfrom(const TOutputBufferSizeType::type& t) {
   switch (t) {
+    case TOutputBufferSizeType::kConstant:
+      return table_functions::OutputBufferSizeType::kConstant;
     case TOutputBufferSizeType::kUserSpecifiedConstantParameter:
       return table_functions::OutputBufferSizeType::kUserSpecifiedConstantParameter;
     case TOutputBufferSizeType::kUserSpecifiedRowMultiplier:
       return table_functions::OutputBufferSizeType::kUserSpecifiedRowMultiplier;
-    case TOutputBufferSizeType::kConstant:
-      return table_functions::OutputBufferSizeType::kConstant;
   }
   UNREACHABLE();
   return table_functions::OutputBufferSizeType{};
@@ -6008,6 +6073,8 @@ void DBHandler::register_runtime_extension_functions(
   }
 
   VLOG(1) << "Registering runtime UDTFs:\n";
+
+  table_functions::TableFunctionsFactory::reset();
 
   for (auto it = udtfs.begin(); it != udtfs.end(); it++) {
     VLOG(1) << "UDTF name=" << it->name << std::endl;
@@ -6076,6 +6143,115 @@ void DBHandler::getUserSessions(const Catalog_Namespace::SessionInfo& session_in
   }
 }
 
+void DBHandler::getQueries(const Catalog_Namespace::SessionInfo& session_info,
+                           TQueryResult& _return) {
+  if (!session_info.get_currentUser().isSuper) {
+    throw std::runtime_error(
+        "SHOW QUERIES failed, because it can only be executed by super user.");
+  } else if (!g_enable_runtime_query_interrupt) {
+    throw std::runtime_error(
+        "SHOW QUERIES failed, because runtime query interrupt is disabled.");
+  } else {
+    mapd_lock_guard<mapd_shared_mutex> read_lock(sessions_mutex_);
+    const std::vector<std::string> col_names{"query_session_id",
+                                             "current_status",
+                                             "submitted",
+                                             "query_str",
+                                             "login_name",
+                                             "client_address",
+                                             "db_name",
+                                             "exec_device_type"};
+
+    // Make columns for TQueryResult
+    TRowDescriptor row_desc;
+    for (const auto& col : col_names) {
+      TColumnType columnType;
+      columnType.col_name = col;
+      columnType.col_type.type = TDatumType::STR;
+      row_desc.push_back(columnType);
+      _return.row_set.columns.emplace_back(TColumn());
+    }
+    _return.row_set.row_desc = row_desc;
+    _return.row_set.is_columnar = true;
+
+    if (!sessions_.empty()) {
+      for (auto sessions = sessions_.begin(); sessions_.end() != sessions; sessions++) {
+        const auto id = sessions->first;
+        const auto query_session_ptr = sessions->second;
+
+        auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID,
+                                              jit_debug_ ? "/tmp" : "",
+                                              jit_debug_ ? "mapdquery" : "",
+                                              system_parameters_);
+        CHECK(executor);
+        mapd_shared_lock<mapd_shared_mutex> session_read_lock(executor->getSessionLock());
+        auto query_info = executor->getQuerySessionInfo(
+            query_session_ptr->get_session_id(), session_read_lock);
+        session_read_lock.unlock();
+        // if there exists query info fired from this session we report it to user
+        if (query_info.has_value()) {
+          int col_num = 0;
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(
+              query_session_ptr->get_public_session_id());
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(
+              query_info->getQueryStatus());
+          std::time_t t =
+              std::chrono::system_clock::to_time_t(query_info->getQuerySubmittedTime());
+          std::stringstream tss;
+          tss << std::put_time(std::localtime(&t), "%F %T");
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(tss.str());
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(
+              query_info->getQueryStr());
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(
+              query_session_ptr->get_currentUser().userName);
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(
+              query_session_ptr->get_connection_info());
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(
+              query_session_ptr->getCatalog().getCurrentDB().dbName);
+          std::string exec_device_type =
+              query_session_ptr->get_executor_device_type() == ExecutorDeviceType::GPU
+                  ? "GPU"
+                  : "CPU";
+          _return.row_set.columns[col_num++].data.str_col.emplace_back(exec_device_type);
+
+          for (auto& col : _return.row_set.columns) {
+            col.nulls.push_back(false);
+          }
+        }
+      }
+    }
+  }
+}
+
+void DBHandler::interruptQuery(const Catalog_Namespace::SessionInfo& session_info,
+                               const std::string& target_session) {
+  if (!g_enable_runtime_query_interrupt) {
+    // todo(yoonmin): change this to allow per-query interruptability
+    throw std::runtime_error(
+        "KILL QUERY failed because runtime query interrupt is disabled.");
+  }
+  if (!session_info.get_currentUser().isSuper.load()) {
+    throw std::runtime_error(
+        "Only super user can interrupt the query via KILL QUERY command.");
+  }
+  CHECK_EQ(target_session.length(), (unsigned long)8);
+  for (auto& kv : sessions_) {
+    if (kv.second->get_public_session_id() == target_session) {
+      auto target_query_session = kv.second->get_session_id();
+      auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID,
+                                            jit_debug_ ? "/tmp" : "",
+                                            jit_debug_ ? "mapdquery" : "",
+                                            system_parameters_);
+      CHECK(executor);
+      if (leaf_aggregator_.leafCount() > 0) {
+        leaf_aggregator_.interrupt(target_query_session, session_info.get_session_id());
+      }
+      executor->interrupt(target_query_session, session_info.get_session_id());
+      break;
+    }
+  }
+}
+
 void DBHandler::executeDdl(
     TQueryResult& _return,
     const std::string& query_ra,
@@ -6083,6 +6259,10 @@ void DBHandler::executeDdl(
   DdlCommandExecutor executor = DdlCommandExecutor(query_ra, session_ptr);
   if (executor.isShowUserSessions()) {
     getUserSessions(*session_ptr, _return);
+  } else if (executor.isShowQueries()) {
+    getQueries(*session_ptr, _return);
+  } else if (executor.isKillQuery()) {
+    interruptQuery(*session_ptr, executor.getTargetQuerySessionToKill());
   } else {
     executor.execute(_return);
   }

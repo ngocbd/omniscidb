@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "MapDServer.h"
 #include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
 #include "ThriftHandler/DBHandler.h"
 
@@ -35,7 +34,7 @@
 #include <thrift/transport/TServerSocket.h>
 
 #include "Archive/S3Archive.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 #include "Shared/SystemParameters.h"
 #include "Shared/file_delete.h"
 #include "Shared/mapd_shared_mutex.h"
@@ -54,7 +53,9 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+
 #include "MapDRelease.h"
+#include "DataMgr/ForeignStorage/ForeignTableRefresh.h"
 #include "Shared/Compressor.h"
 #include "Shared/SystemParameters.h"
 #include "Shared/file_delete.h"
@@ -348,6 +349,7 @@ int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server
                                      prog_config_opts.read_only,
                                      prog_config_opts.allow_loop_joins,
                                      prog_config_opts.enable_rendering,
+                                     prog_config_opts.renderer_use_vulkan_driver,
                                      prog_config_opts.enable_auto_clear_render_mem,
                                      prog_config_opts.render_oom_retry_threshold,
                                      prog_config_opts.render_mem_bytes,
@@ -365,14 +367,17 @@ int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server
                                      prog_config_opts.enable_runtime_udf,
                                      prog_config_opts.udf_file_name,
                                      prog_config_opts.udf_compiler_path,
-                                     prog_config_opts.udf_compiler_options
+                                     prog_config_opts.udf_compiler_options,
 #ifdef ENABLE_GEOS
-                                     ,
-                                     prog_config_opts.libgeos_so_filename
+                                     prog_config_opts.libgeos_so_filename,
 #endif
-        );
+                                     prog_config_opts.disk_cache_config);
   } catch (const std::exception& e) {
     LOG(FATAL) << "Failed to initialize service handler: " << e.what();
+  }
+
+  if (g_enable_fsi) {
+    foreign_storage::ForeignTableRefreshScheduler::start(g_running);
   }
 
   mapd::shared_ptr<TServerSocket> serverSocket;
@@ -413,7 +418,8 @@ int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server
   };
 
   if (prog_config_opts.system_parameters.ha_group_id.empty()) {
-    mapd::shared_ptr<TProcessor> processor(new TrackingProcessor(g_mapd_handler));
+    mapd::shared_ptr<TProcessor> processor(
+        new TrackingProcessor(g_mapd_handler, prog_config_opts.log_user_origin));
     mapd::shared_ptr<TTransportFactory> bufTransportFactory(
         new TBufferedTransportFactory());
     mapd::shared_ptr<TProtocolFactory> bufProtocolFactory(new TBinaryProtocolFactory());
@@ -470,6 +476,10 @@ int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server
   file_delete_thread.join();
   heartbeat_thread.join();
   ForeignStorageInterface::destroy();
+
+  if (g_enable_fsi) {
+    foreign_storage::ForeignTableRefreshScheduler::stop();
+  }
 
   int signum = g_saw_signal;
   if (signum <= 0 || signum == SIGTERM) {

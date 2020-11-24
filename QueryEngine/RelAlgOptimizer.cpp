@@ -15,8 +15,8 @@
  */
 
 #include "RelAlgOptimizer.h"
+#include "Logger/Logger.h"
 #include "RexVisitor.h"
-#include "Shared/Logger.h"
 #include "Visitors/RexSubQueryIdCollector.h"
 
 #include <numeric>
@@ -326,7 +326,7 @@ void redirect_inputs_of(
 
 void cleanup_dead_nodes(std::vector<std::shared_ptr<RelAlgNode>>& nodes) {
   for (auto nodeIt = nodes.rbegin(); nodeIt != nodes.rend(); ++nodeIt) {
-    if (nodeIt->unique()) {
+    if (nodeIt->use_count() == 1) {
       LOG(INFO) << "ID=" << (*nodeIt)->getId() << " " << (*nodeIt)->toString()
                 << " deleted!";
       nodeIt->reset();
@@ -722,14 +722,19 @@ std::vector<std::unordered_set<size_t>> get_live_ins(
     return {live_in};
   }
   if (auto table_func = dynamic_cast<const RelTableFunction*>(node)) {
-    CHECK_EQ(size_t(1), table_func->inputCount());
-
     const auto input_count = table_func->size();
     std::unordered_set<size_t> live_in;
     for (size_t i = 0; i < input_count; i++) {
       live_in.insert(i);
     }
-    return {live_in};
+
+    std::vector<std::unordered_set<size_t>> result;
+    // Is the computed result correct in general?
+    for (size_t i = table_func->inputCount(); i > 0; i--) {
+      result.push_back(live_in);
+    }
+
+    return result;
   }
   if (auto logical_union = dynamic_cast<const RelLogicalUnion*>(node)) {
     return std::vector<std::unordered_set<size_t>>(logical_union->inputCount(), live_out);
@@ -905,13 +910,15 @@ std::unordered_map<const RelAlgNode*, std::unordered_set<size_t>> mark_live_colu
   for (auto node_it = nodes.rbegin(); node_it != nodes.rend(); ++node_it) {
     auto node = node_it->get();
     if (dynamic_cast<const RelScan*>(node) || live_outs.count(node) ||
-        dynamic_cast<const RelModify*>(node)) {
+        dynamic_cast<const RelModify*>(node) ||
+        dynamic_cast<const RelTableFunction*>(node)) {
       continue;
     }
     std::vector<size_t> all_live(node->size());
     std::iota(all_live.begin(), all_live.end(), size_t(0));
     live_outs.insert(std::make_pair(
         node, std::unordered_set<size_t>(all_live.begin(), all_live.end())));
+
     work_set.push_back(node);
     while (!work_set.empty()) {
       auto walker = work_set.back();
@@ -922,7 +929,8 @@ std::unordered_map<const RelAlgNode*, std::unordered_set<size_t>> mark_live_colu
       CHECK_EQ(live_ins.size(), walker->inputCount());
       for (size_t i = 0; i < walker->inputCount(); ++i) {
         auto src = walker->getInput(i);
-        if (dynamic_cast<const RelScan*>(src) || live_ins[i].empty()) {
+        if (dynamic_cast<const RelScan*>(src) ||
+            dynamic_cast<const RelTableFunction*>(src) || live_ins[i].empty()) {
           continue;
         }
         if (!live_outs.count(src)) {
@@ -1497,8 +1505,10 @@ void fold_filters(std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept {
 
   if (!nodes.empty()) {
     auto sink = nodes.back();
-    for (auto node_it = std::next(nodes.rend()); !sink && node_it != nodes.rbegin();
-         ++node_it) {
+    for (auto node_it = std::next(nodes.rbegin()); node_it != nodes.rend(); ++node_it) {
+      if (sink) {
+        break;
+      }
       sink = *node_it;
     }
     CHECK(sink);

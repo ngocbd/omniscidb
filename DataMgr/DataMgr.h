@@ -27,8 +27,8 @@
 #include "AbstractBufferMgr.h"
 #include "BufferMgr/Buffer.h"
 #include "BufferMgr/BufferMgr.h"
-#include "ForeignStorage/ForeignStorageMgr.h"
 #include "MemoryLevel.h"
+#include "PersistentStorageMgr/PersistentStorageMgr.h"
 
 #include <iomanip>
 #include <iostream>
@@ -52,7 +52,7 @@ struct MemoryData {
   size_t slabNum;
   int32_t startPage;
   size_t numPages;
-  u_int32_t touch;
+  uint32_t touch;
   std::vector<int32_t> chunk_key;
   Buffer_Namespace::MemStatus memStatus;
 };
@@ -161,14 +161,14 @@ class DataMgr {
   friend class GlobalFileMgr;
 
  public:
-  DataMgr(const std::string& dataDir,
-          const SystemParameters& system_parameters,
-          const bool useGpus,
-          const int numGpus,
-          const int startGpu = 0,
-          const size_t reservedGpuMem = (1 << 27),
-          const size_t numReaderThreads =
-              0); /* 0 means use default for # of reader threads */
+  explicit DataMgr(
+      const std::string& dataDir,
+      const SystemParameters& system_parameters,
+      std::unique_ptr<CudaMgr_Namespace::CudaMgr> cudaMgr,
+      const bool useGpus,
+      const size_t reservedGpuMem = (1 << 27),
+      const size_t numReaderThreads = 0, /* 0 means use default for # of reader threads */
+      const DiskCacheConfig cacheConfig = DiskCacheConfig());
   ~DataMgr();
   AbstractBuffer* createChunkBuffer(const ChunkKey& key,
                                     const MemoryLevel memoryLevel,
@@ -196,7 +196,6 @@ class DataMgr {
   const std::map<ChunkKey, File_Namespace::FileBuffer*>& getChunkMap();
   void checkpoint(const int db_id,
                   const int tb_id);  // checkpoint for individual table of DB
-  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec);
   void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
                                        const ChunkKey& keyPrefix);
   inline bool gpusPresent() { return hasGpus_; }
@@ -223,11 +222,15 @@ class DataMgr {
   SystemMemoryUsage getSystemMemoryUsage() const;
   static size_t getTotalSystemMemory();
 
-  foreign_storage::ForeignStorageMgr* getForeignStorageMgr() const;
+  PersistentStorageMgr* getPersistentStorageMgr() const;
+  void resetPersistentStorage(const DiskCacheConfig& cache_config,
+                              const size_t num_reader_threads,
+                              const SystemParameters& sys_params);
 
  private:
   void populateMgrs(const SystemParameters& system_parameters,
-                    const size_t userSpecifiedNumReaderThreads);
+                    const size_t userSpecifiedNumReaderThreads,
+                    const DiskCacheConfig& cache_config);
   void convertDB(const std::string basePath);
   void checkpoint();  // checkpoint for whole DB, called from convertDB proc only
   void createTopLevelMetadata() const;

@@ -22,6 +22,7 @@
 #include <fstream>
 
 #include <gtest/gtest.h>
+#include <picosha2.h>
 
 #include "Tests/DBHandlerTestHelpers.h"
 #include "Tests/TestHelpers.h"
@@ -197,6 +198,344 @@ INSTANTIATE_TEST_SUITE_P(FilePathWhitelistTest,
                          FilePathWhitelistTest,
                          testing::Values("CopyFrom", "CopyTo", "ForeignTable"),
                          [](const auto& param_info) { return param_info.param; });
+
+TEST_F(FilePathWhitelistTest, DetectTypesBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  auto db_handler_and_session_id = getDbHandlerAndSessionId();
+  auto db_handler = db_handler_and_session_id.first;
+  auto session_id = db_handler_and_session_id.second;
+  TDetectResult temp;
+  executeLambdaAndAssertException(
+      [&] {
+        db_handler->detect_column_types(temp, session_id, file_path, TCopyParams{});
+      },
+      "Access to file or directory path \"" + file_path + "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, ImportTableBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  auto db_handler_and_session_id = getDbHandlerAndSessionId();
+  auto db_handler = db_handler_and_session_id.first;
+  auto session_id = db_handler_and_session_id.second;
+  executeLambdaAndAssertException(
+      [&] {
+        db_handler->import_table(session_id, "test_table", file_path, TCopyParams{});
+      },
+      "Exception: Access to file or directory path \"" + file_path +
+          "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, ImportGeoTableBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  auto db_handler_and_session_id = getDbHandlerAndSessionId();
+  auto db_handler = db_handler_and_session_id.first;
+  auto session_id = db_handler_and_session_id.second;
+  executeLambdaAndAssertException(
+      [&] {
+        db_handler->import_geo_table(session_id,
+                                     "test1",
+                                     file_path,
+                                     TCopyParams{},
+                                     TRowDescriptor{},
+                                     TCreateParams{});
+      },
+      "Access to file or directory path \"" + file_path + "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, GetFirstGeoFileBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  auto db_handler_and_session_id = getDbHandlerAndSessionId();
+  auto db_handler = db_handler_and_session_id.first;
+  auto session_id = db_handler_and_session_id.second;
+  std::string temp;
+  executeLambdaAndAssertException(
+      [&] {
+        db_handler->get_first_geo_file_in_archive(
+            temp, session_id, file_path, TCopyParams());
+      },
+      "Access to file or directory path \"" + file_path + "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, GetAllFilesBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  auto db_handler_and_session_id = getDbHandlerAndSessionId();
+  auto db_handler = db_handler_and_session_id.first;
+  auto session_id = db_handler_and_session_id.second;
+  std::vector<std::string> temp;
+  executeLambdaAndAssertException(
+      [&] {
+        db_handler->get_all_files_in_archive(temp, session_id, file_path, TCopyParams());
+      },
+      "Access to file or directory path \"" + file_path + "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, GetLayersInGeoFileBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  auto db_handler_and_session_id = getDbHandlerAndSessionId();
+  auto db_handler = db_handler_and_session_id.first;
+  auto session_id = db_handler_and_session_id.second;
+  std::vector<TGeoFileLayerInfo> temp;
+  executeLambdaAndAssertException(
+      [&] {
+        db_handler->get_layers_in_geo_file(temp, session_id, file_path, TCopyParams());
+      },
+      "Access to file or directory path \"" + file_path + "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, DumpTableBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  queryAndAssertException("DUMP TABLE test_table TO '" + file_path + "';",
+                          "Exception: Access to file or directory path \"" + file_path +
+                              "\" is not allowed.");
+}
+
+TEST_F(FilePathWhitelistTest, RestoreTableBlacklist) {
+  const auto& file_path = temp_file_path_;
+  ddl_utils::FilePathBlacklist::addToBlacklist(file_path);
+  queryAndAssertException("RESTORE TABLE test1 FROM '" + file_path + "';",
+                          "Exception: Access to file or directory path \"" + file_path +
+                              "\" is not allowed.");
+}
+
+namespace {
+enum class FileLocationType {
+  RELATIVE,
+  ABSOLUTE,
+#ifdef HAVE_AWS_S3
+  S3,
+#endif  // HAVE_AWS_S3
+  HTTP,
+  HTTPS,
+  First = RELATIVE,
+  Last = HTTPS
+};
+}  // namespace
+
+class DBHandlerFilePathTest
+    : public DBHandlerTestFixture,
+      public testing::WithParamInterface<std::tuple<int, std::string>> {
+ public:
+  static std::string testParamsToString(const std::tuple<int, std::string>& params) {
+    auto [file_location_type, suffix] = getTestParams(params);
+    std::string param_str;
+    if (file_location_type == FileLocationType::RELATIVE) {
+      param_str = "RelativePath";
+    } else if (file_location_type == FileLocationType::ABSOLUTE) {
+      param_str = "AbsolutePath";
+#ifdef HAVE_AWS_S3
+    } else if (file_location_type == FileLocationType::S3) {
+      param_str = "S3";
+#endif  // HAVE_AWS_S3
+    } else if (file_location_type == FileLocationType::HTTPS) {
+      param_str = "Https";
+    } else if (file_location_type == FileLocationType::HTTP) {
+      param_str = "Http";
+    } else {
+      UNREACHABLE();
+    }
+    return param_str + suffix;
+  }
+
+ protected:
+  static void SetUpTestSuite() {
+    createDBHandler();
+    sql("CREATE TABLE IF NOT EXISTS test_table (col1 TEXT);");
+    sql("CREATE TABLE IF NOT EXISTS test_table_2 (omnisci_geo POINT);");
+    boost::filesystem::create_directory(getImportPath());
+  }
+
+  static void TearDownTestSuite() {
+    sql("DROP TABLE IF EXISTS test_table;");
+    sql("DROP TABLE IF EXISTS test_table_2;");
+    boost::filesystem::remove_all(getImportPath());
+  }
+
+  static boost::filesystem::path getImportPath() {
+    return boost::filesystem::canonical(BASE_PATH) / "mapd_import";
+  }
+
+  std::string getFilePath(const std::string& file_name_prefix) {
+    auto [file_location_type, suffix] = getTestParams();
+    std::replace(suffix.begin(), suffix.end(), '_', '.');
+
+    std::string file_name = file_name_prefix + suffix;
+    std::string path;
+    if (file_location_type == FileLocationType::HTTPS) {
+      path = "https://omnisci-import-test.s3-us-west-1.amazonaws.com/" + file_name;
+    } else if (file_location_type == FileLocationType::HTTP) {
+      path = "http://omnisci-import-test.s3-us-west-1.amazonaws.com/" + file_name;
+#ifdef HAVE_AWS_S3
+    } else if (file_location_type == FileLocationType::S3) {
+      path = "s3://omnisci-import-test/" + file_name;
+#endif  // HAVE_AWS_S3
+    } else {
+      auto session_id = getDbHandlerAndSessionId().second;
+      auto session_directory = getImportPath() / picosha2::hash256_hex_string(session_id);
+      if (!boost::filesystem::exists(session_directory)) {
+        boost::filesystem::create_directory(session_directory);
+      }
+      auto full_file_path =
+          session_directory / boost::filesystem::path(file_name).filename();
+      if (!boost::filesystem::exists(full_file_path)) {
+        boost::filesystem::copy_file("../../Tests/FilePathWhitelist/" + file_name,
+                                     full_file_path);
+      }
+      if (file_location_type == FileLocationType::ABSOLUTE) {
+        path = full_file_path.string();
+      } else if (file_location_type == FileLocationType::RELATIVE) {
+        path = file_name;
+      } else {
+        UNREACHABLE();
+      }
+    }
+    return path;
+  }
+
+  static std::pair<FileLocationType, std::string> getTestParams(
+      const std::tuple<int, std::string>& params = GetParam()) {
+    return {static_cast<FileLocationType>(std::get<0>(params)), std::get<1>(params)};
+  }
+};
+
+TEST_P(DBHandlerFilePathTest, DetectColumnTypes) {
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  TDetectResult result;
+  db_handler->detect_column_types(
+      result, session_id, getFilePath("example.csv"), TCopyParams{});
+}
+
+TEST_P(DBHandlerFilePathTest, DetectColumnTypes_GeoFile) {
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  TDetectResult result;
+  db_handler->detect_column_types(
+      result, session_id, getFilePath("example.geojson"), TCopyParams{});
+}
+
+TEST_P(DBHandlerFilePathTest, ImportTable) {
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  db_handler->import_table(
+      session_id, "test_table", getFilePath("example.csv"), TCopyParams{});
+}
+
+TEST_P(DBHandlerFilePathTest, ImportGeoTable) {
+// TODO: Undo test case skipping when GDAL failure is resolved
+#ifdef HAVE_AWS_S3
+  if (auto [file_location_type, suffix] = getTestParams();
+      file_location_type == FileLocationType::S3 && suffix == "_tar_gz") {
+    GTEST_SKIP();
+  }
+#endif  // HAVE_AWS_S3
+
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  db_handler->import_geo_table(session_id,
+                               "test_table_2",
+                               getFilePath("example.geojson"),
+                               TCopyParams{},
+                               TRowDescriptor{},
+                               TCreateParams{});
+}
+
+TEST_P(DBHandlerFilePathTest, GetFirstGeoFileInArchive) {
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  std::string result;
+  db_handler->get_first_geo_file_in_archive(
+      result, session_id, getFilePath("example.geojson"), TCopyParams());
+}
+
+TEST_P(DBHandlerFilePathTest, GetAllFilesInArchive) {
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  std::vector<std::string> result;
+  db_handler->get_all_files_in_archive(
+      result, session_id, getFilePath("example.geojson"), TCopyParams());
+}
+
+TEST_P(DBHandlerFilePathTest, GetLayersInGeoFile) {
+// TODO: Undo test case skipping when GDAL failure is resolved
+#ifdef HAVE_AWS_S3
+  if (auto [file_location_type, suffix] = getTestParams();
+      file_location_type == FileLocationType::S3 && suffix == "_tar_gz") {
+    GTEST_SKIP();
+  }
+#endif  // HAVE_AWS_S3
+
+  auto [db_handler, session_id] = getDbHandlerAndSessionId();
+  std::vector<TGeoFileLayerInfo> result;
+  db_handler->get_layers_in_geo_file(
+      result, session_id, getFilePath("example.geojson"), TCopyParams());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DBHandlerFilePathTest,
+    DBHandlerFilePathTest,
+    testing::Combine(testing::Range(static_cast<int>(FileLocationType::First),
+                                    static_cast<int>(FileLocationType::Last) + 1),
+                     testing::Values("", "_tar", "_gz", "_tar_gz")),
+    [](const auto& param_info) {
+      return DBHandlerFilePathTest::testParamsToString(param_info.param);
+    });
+
+TEST_F(FilePathWhitelistTest, ThrowOnPunctuation) {
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("name_with_&", ddl_utils::DataTransferType::IMPORT);
+      },
+      "Punctuation \"&\" is not allowed in file path: name_with_&");
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("name_with_;", ddl_utils::DataTransferType::IMPORT);
+      },
+      "Punctuation \";\" is not allowed in file path: name_with_;");
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("name_with_\\", ddl_utils::DataTransferType::IMPORT);
+      },
+      "Punctuation \"\\\" is not allowed in file path: name_with_\\");
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("name_with_$", ddl_utils::DataTransferType::IMPORT);
+      },
+      "Punctuation \"$\" is not allowed in file path: name_with_$");
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("name_with_!", ddl_utils::DataTransferType::IMPORT);
+      },
+      "Punctuation \"!\" is not allowed in file path: name_with_!");
+}
+
+TEST_F(FilePathWhitelistTest, ThrowOnAsterisk) {
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("name_with_*", ddl_utils::DataTransferType::IMPORT);
+      },
+      "Punctuation \"*\" is not allowed in file path: name_with_*");
+}
+
+TEST_F(FilePathWhitelistTest, AllowAsteriskForWildcard) {
+  validate_allowed_file_path("/tmp/*", ddl_utils::DataTransferType::IMPORT, true);
+}
+
+TEST_F(FilePathWhitelistTest, AllowRelativePath) {
+  validate_allowed_file_path("./../../Tests/FilePathWhitelist/example.csv",
+                             ddl_utils::DataTransferType::IMPORT);
+}
+
+TEST_F(FilePathWhitelistTest, AllowTilde) {
+  // This test case ensures that an exception is not thrown because of the
+  // presence of the "~" character. Although, an exception is thrown because
+  // the file path does not exist (cannot rely on home directory on test machines).
+  executeLambdaAndAssertException(
+      [&] {
+        validate_allowed_file_path("~/test_path", ddl_utils::DataTransferType::IMPORT);
+      },
+      "File or directory \"~/test_path\" does not exist.");
+}
 
 int main(int argc, char** argv) {
   g_enable_fsi = true;

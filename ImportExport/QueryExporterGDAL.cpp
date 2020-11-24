@@ -14,19 +14,22 @@
  * limitations under the License.
  */
 
-#include <ImportExport/QueryExporterGDAL.h>
+#include "ImportExport/QueryExporterGDAL.h"
 
 #include <array>
 #include <string>
 #include <unordered_set>
 
-#include <ImportExport/GDAL.h>
-#include <QueryEngine/GroupByAndAggregate.h>
-#include <QueryEngine/ResultSet.h>
-#include <Shared/geo_types.h>
-#include <Shared/scope.h>
+#include <boost/filesystem.hpp>
 
 #include <ogrsf_frmts.h>
+
+#include "Geospatial/GDAL.h"
+#include "Geospatial/Types.h"
+#include "QueryEngine/GroupByAndAggregate.h"
+#include "QueryEngine/ResultSet.h"
+#include "Shared/misc.h"
+#include "Shared/scope.h"
 
 namespace import_export {
 
@@ -83,7 +86,7 @@ static constexpr std::array<std::array<bool, 3>, 4> compression_implemented = {
      {true, false, false}}};  // Shapefile: none
 
 static std::array<std::unordered_set<std::string>, 4> file_type_valid_extensions = {
-    {{".csv", ".tsv"}, {".geojson"}, {".geojson", ".json"}, {".shp"}}};
+    {{".csv", ".tsv"}, {".geojson", ".json"}, {".geojson", ".json"}, {".shp"}}};
 
 OGRFieldType sql_type_info_to_ogr_field_type(const std::string& name,
                                              const SQLTypeInfo& type_info,
@@ -164,7 +167,7 @@ void QueryExporterGDAL::beginExport(const std::string& file_path,
                          file_type_valid_extensions[SCI(file_type_)]);
 
   // lazy init GDAL
-  GDAL::init();
+  Geospatial::GDAL::init();
 
   // capture these
   copy_params_ = copy_params;
@@ -176,6 +179,7 @@ void QueryExporterGDAL::beginExport(const std::string& file_path,
     int num_geo_columns = 0;
     int geo_column_srid = 0;
     uint32_t num_columns = 0;
+    std::string geo_column_name;
     for (auto const& column_info : column_infos) {
       auto const& type_info = column_info.get_type_info();
       if (type_info.is_geometry()) {
@@ -196,6 +200,7 @@ void QueryExporterGDAL::beginExport(const std::string& file_path,
             CHECK(false);
         }
         geo_column_srid = type_info.get_output_srid();
+        geo_column_name = safeColumnName(column_info.get_resname(), num_columns + 1);
         num_geo_columns++;
       } else {
         auto column_name = safeColumnName(column_info.get_resname(), num_columns + 1);
@@ -210,6 +215,13 @@ void QueryExporterGDAL::beginExport(const std::string& file_path,
                                "' requires exactly one geo column in query results");
     }
 
+    // validate SRID
+    if (geo_column_srid <= 0) {
+      throw std::runtime_error("Geo column '" + geo_column_name + "' has invalid SRID (" +
+                               std::to_string(geo_column_srid) +
+                               "). Use ST_SetSRID() in query to override.");
+    }
+
     // get driver
     auto const& driver_name = driver_names[SCI(file_type_)];
     auto gdal_driver = GetGDALDriverManager()->GetDriverByName(driver_name);
@@ -219,7 +231,8 @@ void QueryExporterGDAL::beginExport(const std::string& file_path,
     }
 
     // compression?
-    auto actual_file_path{file_path};
+    auto gdal_file_path{file_path};
+    auto user_file_path{file_path};
     if (file_compression != FileCompression::kNone) {
       auto impl = compression_implemented[SCI(file_type_)][SCI(file_compression)];
       if (!impl) {
@@ -228,13 +241,27 @@ void QueryExporterGDAL::beginExport(const std::string& file_path,
             "Selected file compression option not yet supported for file type '" +
             std::string(file_type_names[SCI(file_type_)]) + "'");
       }
-      actual_file_path.insert(0, compression_prefix[SCI(file_compression)]);
-      actual_file_path.append(compression_suffix[SCI(file_compression)]);
+      gdal_file_path.insert(0, compression_prefix[SCI(file_compression)]);
+      gdal_file_path.append(compression_suffix[SCI(file_compression)]);
+      user_file_path.append(compression_suffix[SCI(file_compression)]);
     }
+
+    // delete any existing file(s) (with and without compression suffix)
+    // GeoJSON driver occasionally refuses to overwrite
+    auto remove_file = [](const std::string& filename) {
+      if (boost::filesystem::exists(filename)) {
+        LOG(INFO) << "Deleting existing file '" << filename << "'";
+        boost::filesystem::remove(filename);
+      }
+    };
+    remove_file(file_path);
+    remove_file(user_file_path);
+
+    LOG(INFO) << "Exporting to file '" << user_file_path << "'";
 
     // create dataset
     gdal_dataset_ =
-        gdal_driver->Create(actual_file_path.c_str(), 0, 0, 0, GDT_Unknown, NULL);
+        gdal_driver->Create(gdal_file_path.c_str(), 0, 0, 0, GDT_Unknown, NULL);
     if (gdal_dataset_ == nullptr) {
       throw std::runtime_error("Failed to create File '" + file_path + "'");
     }
@@ -301,14 +328,14 @@ void insert_geo_column(const GeoTargetValue* geo_tv,
       auto const point_tv = boost::get<GeoPointTargetValue>(geo_tv->get());
       auto* coords = point_tv.coords.get();
       CHECK(coords);
-      Geo_namespace::GeoPoint point(*coords);
+      Geospatial::GeoPoint point(*coords);
       ogr_feature->SetGeometry(point.getOGRGeometry());
     } break;
     case kLINESTRING: {
       auto const linestring_tv = boost::get<GeoLineStringTargetValue>(geo_tv->get());
       auto* coords = linestring_tv.coords.get();
       CHECK(coords);
-      Geo_namespace::GeoLineString linestring(*coords);
+      Geospatial::GeoLineString linestring(*coords);
       ogr_feature->SetGeometry(linestring.getOGRGeometry());
     } break;
     case kPOLYGON: {
@@ -317,7 +344,7 @@ void insert_geo_column(const GeoTargetValue* geo_tv,
       CHECK(coords);
       auto* ring_sizes = polygon_tv.ring_sizes.get();
       CHECK(ring_sizes);
-      Geo_namespace::GeoPolygon polygon(*coords, *ring_sizes);
+      Geospatial::GeoPolygon polygon(*coords, *ring_sizes);
       ogr_feature->SetGeometry(polygon.getOGRGeometry());
     } break;
     case kMULTIPOLYGON: {
@@ -328,7 +355,7 @@ void insert_geo_column(const GeoTargetValue* geo_tv,
       CHECK(ring_sizes);
       auto* poly_rings = multipolygon_tv.poly_rings.get();
       CHECK(poly_rings);
-      Geo_namespace::GeoMultiPolygon multipolygon(*coords, *ring_sizes, *poly_rings);
+      Geospatial::GeoMultiPolygon multipolygon(*coords, *ring_sizes, *poly_rings);
       ogr_feature->SetGeometry(multipolygon.getOGRGeometry());
     } break;
     default:
@@ -379,11 +406,10 @@ void insert_scalar_column(const ScalarTargetValue* scalar_tv,
       ogr_feature->SetFieldNull(field_index);
     } else if (ti.get_type() == kTIME) {
       CHECK_EQ(field_type, OFTString);
-      auto const t = static_cast<time_t>(int_val);
-      std::tm tm_struct;
-      gmtime_r(&t, &tm_struct);
-      char buf[9];
-      strftime(buf, 9, "%T", &tm_struct);
+      constexpr size_t buf_size = 9;
+      char buf[buf_size];
+      size_t const len = shared::formatHMS(buf, buf_size, int_val);
+      CHECK_EQ(8u, len);  // 8 == strlen("HH:MM:SS")
       ogr_feature->SetField(field_index, buf);
     } else if (is_int64) {
       CHECK_EQ(field_type, OFTInteger64);
@@ -513,11 +539,10 @@ void insert_array_column(const ArrayTargetValue* array_tv,
         if (is_null) {
           string_values.emplace_back("");
         } else {
-          auto const t = static_cast<time_t>(int_val);
-          std::tm tm_struct;
-          gmtime_r(&t, &tm_struct);
-          char buf[9];
-          strftime(buf, 9, "%T", &tm_struct);
+          constexpr size_t buf_size = 9;
+          char buf[buf_size];
+          size_t const len = shared::formatHMS(buf, buf_size, int_val);
+          CHECK_EQ(8u, len);  // 8 == strlen("HH:MM:SS")
           string_values.emplace_back(buf);
         }
       } else if (is_int64) {
@@ -657,9 +682,11 @@ void QueryExporterGDAL::exportResults(
                                   array_null_handling_);
             } else {
               auto const geo_tv = boost::get<GeoTargetValue>(&tv);
-              CHECK(geo_tv);
-              CHECK(geo_tv->is_initialized());
-              insert_geo_column(geo_tv, ti, field_index, ogr_feature);
+              if (geo_tv && geo_tv->is_initialized()) {
+                insert_geo_column(geo_tv, ti, field_index, ogr_feature);
+              } else {
+                ogr_feature->SetGeometry(nullptr);
+              }
             }
           }
         }

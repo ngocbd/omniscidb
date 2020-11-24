@@ -133,6 +133,17 @@ class DropForeignTableCommand : public DdlCommand {
   void execute(TQueryResult& _return) override;
 };
 
+class AlterForeignTableCommand : public DdlCommand {
+ public:
+  AlterForeignTableCommand(
+      const rapidjson::Value& ddl_payload,
+      std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr);
+  void execute(TQueryResult& _return) override;
+
+ private:
+  void setForeignTableOptions();
+};
+
 class ShowForeignServersCommand : public DdlCommand {
  public:
   ShowForeignServersCommand(
@@ -183,6 +194,21 @@ class DdlCommandExecutor {
    * Returns true if this command is SHOW USER SESSIONS
    */
   bool isShowUserSessions();
+
+  /**
+   * Returns true if this command is SHOW QUERIES
+   */
+  bool isShowQueries();
+
+  /**
+   * Returns true if this command is KILL QUERY
+   */
+  bool isKillQuery();
+
+  /**
+   * Returns target query session if this command is KILL QUERY
+   */
+  const std::string getTargetQuerySessionToKill();
 
  private:
   rapidjson::Document ddl_query_;

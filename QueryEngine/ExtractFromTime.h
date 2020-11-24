@@ -19,7 +19,7 @@
 
 #include <cstdint>
 #include <ctime>
-#include "../Shared/funcannotations.h"
+#include "Shared/funcannotations.h"
 
 static constexpr int64_t kNanoSecsPerSec = 1000000000;
 static constexpr int64_t kMicroSecsPerSec = 1000000;
@@ -66,6 +66,10 @@ static constexpr uint32_t kUSecsPerDay = 86400;
 static constexpr uint32_t kEpochOffsetYear1900 = 2208988800;
 static constexpr uint32_t kSecsJanToMar1900 = 5097600;
 
+// Number of days from March 1 to Jan 1.
+constexpr unsigned MARJAN = 31 + 30 + 31 + 30 + 31 + 31 + 30 + 31 + 30 + 31;
+constexpr unsigned JANMAR = 31 + 28;  // leap day handled separately
+
 enum ExtractField {
   kYEAR,
   kQUARTER,
@@ -83,13 +87,10 @@ enum ExtractField {
   kEPOCH,
   kQUARTERDAY,
   kWEEK,
+  kWEEK_SUNDAY,
+  kWEEK_SATURDAY,
   kDATEEPOCH
 };
-
-// Shared by DateTruncate
-extern "C" DEVICE NEVER_INLINE int64_t extract_dow(const int64_t lcltime);
-
-DEVICE tm gmtime_r_newlib(const int64_t lcltime, tm& res);
 
 DEVICE int64_t ExtractFromTime(ExtractField field, const int64_t timeval);
 

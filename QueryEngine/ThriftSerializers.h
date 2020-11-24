@@ -25,12 +25,14 @@
 
 #include "gen-cpp/serialized_result_set_types.h"
 
-#include "CompilationOptions.h"
-#include "Descriptors/CountDistinctDescriptor.h"
-#include "Descriptors/Types.h"
-
-#include <Shared/ThriftTypesConvert.h>
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
+#include "QueryEngine/AggregatedColRange.h"
+#include "QueryEngine/CompilationOptions.h"
+#include "QueryEngine/Descriptors/CountDistinctDescriptor.h"
+#include "QueryEngine/Descriptors/Types.h"
+#include "QueryEngine/StringDictionaryGenerations.h"
+#include "QueryEngine/TargetMetaInfo.h"
+#include "Shared/ThriftTypesConvert.h"
 
 namespace ThriftSerializers {
 
@@ -45,7 +47,7 @@ inline TResultSetLayout::type layout_to_thrift(const QueryDescriptionType layout
     THRIFT_LAYOUT_CASE(Projection)
     THRIFT_LAYOUT_CASE(NonGroupedAggregate)
     default:
-      CHECK(false);
+      CHECK(false) << static_cast<int>(layout);
   }
   abort();
 }
@@ -63,7 +65,7 @@ inline QueryDescriptionType layout_from_thrift(const TResultSetLayout::type layo
     UNTHRIFT_LAYOUT_CASE(Projection)
     UNTHRIFT_LAYOUT_CASE(NonGroupedAggregate)
     default:
-      CHECK(false);
+      CHECK(false) << static_cast<int>(layout);
   }
   abort();
 }
@@ -83,8 +85,9 @@ inline TAggKind::type agg_kind_to_thrift(const SQLAgg agg) {
     THRIFT_AGGKIND_CASE(SUM)
     THRIFT_AGGKIND_CASE(APPROX_COUNT_DISTINCT)
     THRIFT_AGGKIND_CASE(SAMPLE)
+    THRIFT_AGGKIND_CASE(SINGLE_VALUE)
     default:
-      CHECK(false);
+      CHECK(false) << static_cast<int>(agg);
   }
   abort();
 }
@@ -104,13 +107,64 @@ inline SQLAgg agg_kind_from_thrift(const TAggKind::type agg) {
     UNTHRIFT_AGGKIND_CASE(SUM)
     UNTHRIFT_AGGKIND_CASE(APPROX_COUNT_DISTINCT)
     UNTHRIFT_AGGKIND_CASE(SAMPLE)
+    UNTHRIFT_AGGKIND_CASE(SINGLE_VALUE)
     default:
-      CHECK(false);
+      CHECK(false) << static_cast<int>(agg);
   }
   abort();
 }
 
 #undef UNTHRIFT_AGGKIND_CASE
+
+inline AggregatedColRange column_ranges_from_thrift(
+    const std::vector<TColumnRange>& thrift_column_ranges) {
+  AggregatedColRange column_ranges;
+  for (const auto& thrift_column_range : thrift_column_ranges) {
+    PhysicalInput phys_input{thrift_column_range.col_id, thrift_column_range.table_id};
+    switch (thrift_column_range.type) {
+      case TExpressionRangeType::INTEGER:
+        column_ranges.setColRange(
+            phys_input,
+            ExpressionRange::makeIntRange(thrift_column_range.int_min,
+                                          thrift_column_range.int_max,
+                                          thrift_column_range.bucket,
+                                          thrift_column_range.has_nulls));
+        break;
+      case TExpressionRangeType::FLOAT:
+        column_ranges.setColRange(
+            phys_input,
+            ExpressionRange::makeFloatRange(thrift_column_range.fp_min,
+                                            thrift_column_range.fp_max,
+                                            thrift_column_range.has_nulls));
+        break;
+      case TExpressionRangeType::DOUBLE:
+        column_ranges.setColRange(
+            phys_input,
+            ExpressionRange::makeDoubleRange(thrift_column_range.fp_min,
+                                             thrift_column_range.fp_max,
+                                             thrift_column_range.has_nulls));
+        break;
+      case TExpressionRangeType::INVALID:
+        column_ranges.setColRange(phys_input, ExpressionRange::makeInvalidRange());
+        break;
+      default:
+        CHECK(false);
+    }
+  }
+  return column_ranges;
+}
+
+inline StringDictionaryGenerations string_dictionary_generations_from_thrift(
+    const std::vector<TDictionaryGeneration>& thrift_string_dictionary_generations) {
+  StringDictionaryGenerations string_dictionary_generations;
+  for (const auto& thrift_string_dictionary_generation :
+       thrift_string_dictionary_generations) {
+    string_dictionary_generations.setGeneration(
+        thrift_string_dictionary_generation.dict_id,
+        thrift_string_dictionary_generation.entry_count);
+  }
+  return string_dictionary_generations;
+}
 
 inline TTypeInfo type_info_to_thrift(const SQLTypeInfo& ti) {
   TTypeInfo thrift_ti;
@@ -119,7 +173,11 @@ inline TTypeInfo type_info_to_thrift(const SQLTypeInfo& ti) {
   thrift_ti.encoding = encoding_to_thrift(ti);
   thrift_ti.nullable = !ti.get_notnull();
   thrift_ti.is_array = ti.is_array();
-  thrift_ti.precision = ti.get_precision();
+  // TODO: Properly serialize geospatial subtype. For now, the value in precision is the
+  // same as the value in scale; overload the precision field with the subtype of the
+  // geospatial type (currently kGEOMETRY or kGEOGRAPHY)
+  thrift_ti.precision =
+      IS_GEO(ti.get_type()) ? static_cast<int32_t>(ti.get_subtype()) : ti.get_precision();
   thrift_ti.scale = ti.get_scale();
   thrift_ti.comp_param = ti.get_comp_param();
   thrift_ti.size = ti.get_size();
@@ -129,6 +187,62 @@ inline TTypeInfo type_info_to_thrift(const SQLTypeInfo& ti) {
 inline bool takes_arg(const TargetInfo& target_info) {
   return target_info.is_agg &&
          (target_info.agg_kind != kCOUNT || is_distinct_target(target_info));
+}
+
+inline std::vector<TargetMetaInfo> target_meta_infos_from_thrift(
+    const TRowDescriptor& row_desc) {
+  std::vector<TargetMetaInfo> target_meta_infos;
+  for (const auto& col : row_desc) {
+    target_meta_infos.emplace_back(col.col_name, type_info_from_thrift(col.col_type));
+  }
+  return target_meta_infos;
+}
+
+inline void fixup_geo_column_descriptor(TColumnType& col_type,
+                                        const SQLTypes subtype,
+                                        const int output_srid) {
+  col_type.col_type.precision = static_cast<int>(subtype);
+  col_type.col_type.scale = output_srid;
+}
+
+inline TColumnType target_meta_info_to_thrift(const TargetMetaInfo& target,
+                                              const size_t idx) {
+  TColumnType proj_info;
+  proj_info.col_name = target.get_resname();
+  if (proj_info.col_name.empty()) {
+    proj_info.col_name = "result_" + std::to_string(idx + 1);
+  }
+  const auto& target_ti = target.get_type_info();
+  proj_info.col_type.type = type_to_thrift(target_ti);
+  proj_info.col_type.encoding = encoding_to_thrift(target_ti);
+  proj_info.col_type.nullable = !target_ti.get_notnull();
+  proj_info.col_type.is_array = target_ti.get_type() == kARRAY;
+  if (IS_GEO(target_ti.get_type())) {
+    fixup_geo_column_descriptor(
+        proj_info, target_ti.get_subtype(), target_ti.get_output_srid());
+  } else {
+    proj_info.col_type.precision = target_ti.get_precision();
+    proj_info.col_type.scale = target_ti.get_scale();
+  }
+  if (target_ti.get_type() == kDATE) {
+    proj_info.col_type.size = target_ti.get_size();
+  }
+  proj_info.col_type.comp_param =
+      (target_ti.is_date_in_days() && target_ti.get_comp_param() == 0)
+          ? 32
+          : target_ti.get_comp_param();
+  return proj_info;
+}
+
+inline TRowDescriptor target_meta_infos_to_thrift(
+    const std::vector<TargetMetaInfo>& targets) {
+  TRowDescriptor row_desc;
+  size_t i = 0;
+  for (const auto& target : targets) {
+    row_desc.push_back(target_meta_info_to_thrift(target, i));
+    ++i;
+  }
+  return row_desc;
 }
 
 inline TTargetInfo target_info_to_thrift(const TargetInfo& target_info) {

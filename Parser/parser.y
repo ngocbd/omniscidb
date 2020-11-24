@@ -357,8 +357,8 @@ copy_table_statement:
     }
 	| COPY '(' FWDSTR ')' TO STRING opt_with_option_list
 	{
-	    if (!boost::istarts_with(*($<stringval>3)->get(), "SELECT")) {
-	        throw std::runtime_error("Select statement expected");
+	    if (!boost::istarts_with(*($<stringval>3)->get(), "SELECT") && !boost::istarts_with(*($<stringval>3)->get(), "WITH")) {
+	        throw std::runtime_error("SELECT or WITH statement expected");
 	    }
 	    *($<stringval>3)->get() += ";";
 	    $<nodeval>$ = TrackedPtr<Node>::make(lexer.parsed_node_tokens_, new ExportQueryStmt(($<stringval>3)->release(), ($<stringval>6)->release(), reinterpret_cast<std::list<NameValueAssign*>*>(($<listval>7)->release())));
@@ -1196,6 +1196,7 @@ privilege:
 	|	VIEW { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "VIEW"); }
 	|	EDIT { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "EDIT"); }
 	|	ACCESS { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "ACCESS"); }
+	|	ALTER SERVER { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "ALTER SERVER"); }
 	|	CREATE SERVER { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "CREATE SERVER"); }
 	|	CREATE TABLE { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "CREATE TABLE"); }
 	|	CREATE VIEW { $<stringval>$ = TrackedPtr<std::string>::make(lexer.parsed_str_tokens_ , "CREATE VIEW"); }

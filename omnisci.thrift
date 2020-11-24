@@ -95,6 +95,7 @@ typedef list<TColumnType> TRowDescriptor
 typedef string TSessionId
 typedef string TKrb5Token
 typedef i64 TQueryId
+typedef i64 TSubqueryId
 
 struct TKrb5Session {
   1: TSessionId sessionId
@@ -130,6 +131,11 @@ enum TQueryType {
   SCHEMA_WRITE
 }
 
+enum TArrowTransport {
+  SHARED_MEMORY,
+  WIRE
+}
+
 struct TQueryResult {
   1: TRowSet row_set
   2: i64 execution_time_ms
@@ -147,6 +153,7 @@ struct TDataFrame {
   4: i64 df_size
   5: i64 execution_time_ms
   6: i64 arrow_conversion_time_ms
+  7: binary df_buffer
 }
 
 struct TDBInfo {
@@ -500,6 +507,12 @@ struct TGeoFileLayerInfo {
   2: TGeoFileLayerContents contents;
 }
 
+struct TTableEpochInfo {
+  1: i32 table_id;
+  2: i32 table_epoch;
+  3: i32 leaf_index;
+}
+
 service OmniSci {
   # connection, admin
   TSessionId connect(1: string user, 2: string passwd, 3: string dbname) throws (1: TOmniSciException e)
@@ -529,10 +542,12 @@ service OmniSci {
   void set_table_epoch_by_name (1: TSessionId session 2: string table_name 3: i32 new_epoch) throws (1: TOmniSciException e)
   i32 get_table_epoch (1: TSessionId session 2: i32 db_id 3: i32 table_id);
   i32 get_table_epoch_by_name (1: TSessionId session 2: string table_name);
+  list<TTableEpochInfo> get_table_epochs(1: TSessionId session 2: i32 db_id 3: i32 table_id);
+  void set_table_epochs(1: TSessionId session 2: i32 db_id 3: list<TTableEpochInfo> table_epochs);
   TSessionInfo get_session_info(1: TSessionId session) throws (1: TOmniSciException e)
   # query, render
   TQueryResult sql_execute(1: TSessionId session, 2: string query 3: bool column_format, 4: string nonce, 5: i32 first_n = -1, 6: i32 at_most_n = -1) throws (1: TOmniSciException e)
-  TDataFrame sql_execute_df(1: TSessionId session, 2: string query 3: common.TDeviceType device_type 4: i32 device_id = 0 5: i32 first_n = -1) throws (1: TOmniSciException e)
+  TDataFrame sql_execute_df(1: TSessionId session, 2: string query 3: common.TDeviceType device_type 4: i32 device_id = 0 5: i32 first_n = -1 6: TArrowTransport transport_method) throws (1: TOmniSciException e)
   TDataFrame sql_execute_gdf(1: TSessionId session, 2: string query 3: i32 device_id = 0, 4: i32 first_n = -1) throws (1: TOmniSciException e)
   void deallocate_df(1: TSessionId session, 2: TDataFrame df, 3: common.TDeviceType device_type, 4: i32 device_id = 0) throws (1: TOmniSciException e)
   void interrupt(1: TSessionId query_session, 2: TSessionId interrupt_session) throws (1: TOmniSciException e)
@@ -573,12 +588,12 @@ service OmniSci {
   i64 query_get_outer_fragment_count(1: TSessionId session, 2: string query) throws(1: TOmniSciException e)
   TTableMeta check_table_consistency(1: TSessionId session, 2: i32 table_id) throws (1: TOmniSciException e)
   TPendingQuery start_query(1: TSessionId leaf_session, 2: TSessionId parent_session, 3: string query_ra, 4: bool just_explain, 5: list<i64> outer_fragment_indices) throws (1: TOmniSciException e)
-  TStepResult execute_query_step(1: TPendingQuery pending_query) throws (1: TOmniSciException e)
-  void broadcast_serialized_rows(1: serialized_result_set.TSerializedRows serialized_rows, 2: TRowDescriptor row_desc, 3: TQueryId query_id) throws (1: TOmniSciException e)
+  TStepResult execute_query_step(1: TPendingQuery pending_query, 2: TSubqueryId subquery_id) throws (1: TOmniSciException e)
+  void broadcast_serialized_rows(1: serialized_result_set.TSerializedRows serialized_rows, 2: TRowDescriptor row_desc, 3: TQueryId query_id, 4: TSubqueryId subquery_id, 5: bool is_final_subquery_result) throws (1: TOmniSciException e)
   TPendingRenderQuery start_render_query(1: TSessionId session, 2: i64 widget_id, 3: i16 node_idx, 4: string vega_json) throws (1: TOmniSciException e)
   TRenderStepResult execute_next_render_step(1: TPendingRenderQuery pending_render, 2: TRenderAggDataMap merged_data) throws (1: TOmniSciException e)
   void insert_data(1: TSessionId session, 2: TInsertData insert_data) throws (1: TOmniSciException e)
-  void checkpoint(1: TSessionId session, 2: i32 db_id, 3: i32 table_id) throws (1: TOmniSciException e)
+  void checkpoint(1: TSessionId session, 2: i32 table_id) throws (1: TOmniSciException e)
   # object privileges
   list<string> get_roles(1: TSessionId session) throws (1: TOmniSciException e)
   list<TDBObject> get_db_objects_for_grantee(1: TSessionId session 2: string roleName) throws (1: TOmniSciException e)

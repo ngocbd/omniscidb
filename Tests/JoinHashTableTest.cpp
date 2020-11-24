@@ -27,14 +27,14 @@
 #include "Catalog/Catalog.h"
 #include "Catalog/DBObject.h"
 #include "DataMgr/DataMgr.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/ExtensionFunctionsWhitelist.h"
 #include "QueryEngine/ExternalCacheInvalidators.h"
-#include "QueryEngine/OverlapsJoinHashTable.h"
+#include "QueryEngine/JoinHashTable/OverlapsJoinHashTable.h"
 #include "QueryEngine/ResultSet.h"
 #include "QueryEngine/UDFCompiler.h"
 #include "QueryRunner/QueryRunner.h"
-#include "Shared/Logger.h"
 #include "Shared/thread_count.h"
 #include "TestHelpers.h"
 
@@ -792,6 +792,8 @@ TEST(MultiFragment, KeyedOneToOne) {
     // a1 = b and a2 = b
     auto op = std::make_shared<Analyzer::BinOper>(kBOOLEAN, kEQ, kONE, et1, et2);
     auto hash_table1 = buildKeyed(op);
+    auto baseline = std::dynamic_pointer_cast<BaselineJoinHashTable>(hash_table1);
+    CHECK(baseline);
     EXPECT_EQ(hash_table1->getHashType(), JoinHashTableInterface::HashType::OneToOne);
 
     sql(R"(
@@ -963,11 +965,8 @@ TEST(Other, Regression) {
 
 int main(int argc, char** argv) {
   ::g_enable_overlaps_hashjoin = true;
+  TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
-
-  logger::LogOptions log_options(argv[0]);
-  log_options.severity_ = logger::Severity::FATAL;
-  logger::init(log_options);
 
   QR::init(BASE_PATH);
 

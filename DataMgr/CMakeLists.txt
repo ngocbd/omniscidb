@@ -1,6 +1,7 @@
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
 
 set(datamgr_source_files
+    AbstractBuffer.cpp
     Allocators/CudaAllocator.cpp
     Allocators/ThrustAllocator.cpp
     Chunk/Chunk.cpp
@@ -11,27 +12,36 @@ set(datamgr_source_files
     FileMgr/FileMgr.cpp
     FileMgr/FileBuffer.cpp
     FileMgr/FileInfo.cpp
-    ForeignStorage/ArrowCsvForeignStorage.cpp
+    ForeignStorage/ArrowForeignStorage.cpp
     ForeignStorage/CsvDataWrapper.cpp
+    ForeignStorage/CachingForeignStorageMgr.cpp
     ForeignStorage/DummyForeignStorage.cpp
     ForeignStorage/ForeignStorageInterface.cpp
     ForeignStorage/ForeignStorageBuffer.cpp
     ForeignStorage/ForeignStorageMgr.cpp
     ForeignStorage/ForeignStorageCache.cpp
+    ForeignStorage/FsiJsonUtils.cpp
     ForeignStorage/CacheEvictionAlgorithms/LRUEvictionAlgorithm.cpp
+    ForeignStorage/CsvReader.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBufferMgr.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBuffer.cpp
     BufferMgr/CpuBufferMgr/CpuBufferMgr.cpp
     BufferMgr/CpuBufferMgr/CpuBuffer.cpp
     BufferMgr/BufferMgr.cpp
     BufferMgr/Buffer.cpp
-    ForeignStorage/ForeignStorageBuffer.cpp
-    ForeignStorage/ForeignStorageMgr.cpp
-    ForeignStorage/CsvDataWrapper.cpp
     ForeignStorage/ParquetDataWrapper.cpp
+    PersistentStorageMgr/MutableCachePersistentStorageMgr.cpp
     PersistentStorageMgr/PersistentStorageMgr.cpp
-    ForeignStorage/LazyParquetImporter.cpp
+    ForeignStorage/LazyParquetChunkLoader.cpp
+    ForeignStorage/ParquetShared.cpp
+    ForeignStorage/ForeignTableRefresh.cpp
 )
+
+if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
+if(ENABLE_AWS_S3)
+  list(APPEND datamgr_source_files ForeignStorage/ee/CsvReaderS3.cpp)
+endif()
+endif()
 
 add_library(DataMgr ${datamgr_source_files})
 

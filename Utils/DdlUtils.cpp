@@ -25,8 +25,8 @@
 #include "rapidjson/document.h"
 
 #include "Fragmenter/FragmentDefaultValues.h"
+#include "OSDependent/omnisci_glob.h"
 #include "Parser/ReservedKeywords.h"
-#include "Shared/mapd_glob.h"
 #include "Shared/misc.h"
 
 bool g_use_date_in_days_default_encoding{true};
@@ -238,18 +238,19 @@ void set_default_encoding(ColumnDescriptor& cd) {
 void validate_and_set_fixed_encoding(ColumnDescriptor& cd,
                                      int encoding_size,
                                      const SqlType* column_type) {
-  if (!cd.columnType.is_integer() && !cd.columnType.is_time() &&
-      !cd.columnType.is_decimal()) {
-    throw std::runtime_error(
-        cd.columnName +
-        ": Fixed encoding is only supported for integer or time columns.");
-  }
-
   auto type = cd.columnType.get_type();
   // fixed-bits encoding
   if (type == kARRAY) {
     type = cd.columnType.get_subtype();
   }
+
+  if (!IS_INTEGER(type) && !is_datetime(type) &&
+      !(type == kDECIMAL || type == kNUMERIC)) {
+    throw std::runtime_error(
+        cd.columnName +
+        ": Fixed encoding is only supported for integer or time columns.");
+  }
+
   switch (type) {
     case kSMALLINT:
       if (encoding_size != 8) {
@@ -534,19 +535,20 @@ void validate_non_reserved_keyword(const std::string& column_name) {
   }
 }
 
-void validate_drop_table_type(const TableDescriptor* td,
-                              const TableType expected_table_type) {
+void validate_table_type(const TableDescriptor* td,
+                         const TableType expected_table_type,
+                         const std::string& command) {
   if (td->isView) {
     if (expected_table_type != TableType::VIEW) {
-      throw std::runtime_error(td->tableName + " is a view. Use DROP VIEW.");
+      throw std::runtime_error(td->tableName + " is a view. Use " + command + " VIEW.");
     }
   } else if (td->storageType == StorageType::FOREIGN_TABLE) {
     if (expected_table_type != TableType::FOREIGN_TABLE) {
-      throw std::runtime_error(td->tableName +
-                               " is a foreign table. Use DROP FOREIGN TABLE.");
+      throw std::runtime_error(td->tableName + " is a foreign table. Use " + command +
+                               " FOREIGN TABLE.");
     }
   } else if (expected_table_type != TableType::TABLE) {
-    throw std::runtime_error(td->tableName + " is a table. Use DROP TABLE.");
+    throw std::runtime_error(td->tableName + " is a table. Use " + command + " TABLE.");
   }
 }
 
@@ -586,7 +588,7 @@ std::vector<std::string> get_expanded_file_paths(
     const DataTransferType data_transfer_type) {
   std::vector<std::string> file_paths;
   if (data_transfer_type == DataTransferType::IMPORT) {
-    file_paths = mapd_glob(file_path);
+    file_paths = omnisci::glob(file_path);
     if (file_paths.size() == 0) {
       throw std::runtime_error{"File or directory \"" + file_path + "\" does not exist."};
     }
@@ -609,7 +611,21 @@ std::vector<std::string> get_expanded_file_paths(
 }
 
 void validate_allowed_file_path(const std::string& file_path,
-                                const DataTransferType data_transfer_type) {
+                                const DataTransferType data_transfer_type,
+                                const bool allow_wildcards) {
+  // Reject any punctuation characters except for a few safe ones.
+  // Some punctuation characters present a security risk when passed
+  // to subprocesses. Don't change this without a security review.
+  static const std::string safe_punctuation{"./_+-=:~"};
+  for (const auto& ch : file_path) {
+    if (std::ispunct(ch) && safe_punctuation.find(ch) == std::string::npos &&
+        !(allow_wildcards && ch == '*')) {
+      throw std::runtime_error(std::string("Punctuation \"") + ch +
+                               "\" is not allowed in file path: " + file_path);
+    }
+  }
+
+  // Enforce our whitelist and blacklist for file paths.
   const auto& expanded_file_paths =
       get_expanded_file_paths(file_path, data_transfer_type);
   for (const auto& path : expanded_file_paths) {

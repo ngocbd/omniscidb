@@ -45,7 +45,8 @@ class CodeGenerator {
       const EncodingType enc_type,
       const int dict_id);
 
-  llvm::ConstantInt* codegenIntConst(const Analyzer::Constant* constant);
+  static llvm::ConstantInt* codegenIntConst(const Analyzer::Constant* constant,
+                                            CgenState* cgen_state);
 
   llvm::Value* codegenCastBetweenIntTypes(llvm::Value* operand_lv,
                                           const SQLTypeInfo& operand_ti,
@@ -409,7 +410,7 @@ class CodeGenerator {
 
   // Returns the IR value which holds true iff at least one match has been found for outer
   // join, null if there's no outer join condition on the given nesting level.
-  llvm::Value* foundOuterJoinMatch(const ssize_t nesting_level) const;
+  llvm::Value* foundOuterJoinMatch(const size_t nesting_level) const;
 
   llvm::Value* resolveGroupedColumnReference(const Analyzer::ColumnVar*);
 

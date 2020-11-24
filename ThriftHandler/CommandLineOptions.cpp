@@ -36,10 +36,17 @@ bool g_enable_thrift_logs{false};
 
 extern bool g_use_table_device_offset;
 extern float g_fraction_code_cache_to_evict;
+extern bool g_cache_string_hash;
+
+extern int64_t g_large_ndv_threshold;
+extern size_t g_large_ndv_multiplier;
+extern int64_t g_bitmap_memory_limit;
+extern bool g_enable_calcite_ddl_parser;
 
 unsigned connect_timeout{20000};
 unsigned recv_timeout{300000};
 unsigned send_timeout{300000};
+bool with_keepalive{false};
 
 void CommandLineOptions::init_logging() {
   if (verbose_logging && logger::Severity::DEBUG1 < log_options_.severity_) {
@@ -149,12 +156,19 @@ void CommandLineOptions::fillOptions() {
                               ->default_value(enable_runtime_query_interrupt)
                               ->implicit_value(true),
                           "Enable runtime query interrupt.");
-  help_desc.add_options()("runtime-query-interrupt-frequency",
-                          po::value<unsigned>(&runtime_query_interrupt_frequency)
-                              ->default_value(runtime_query_interrupt_frequency)
+  help_desc.add_options()("pending-query-interrupt-freq",
+                          po::value<unsigned>(&pending_query_interrupt_freq)
+                              ->default_value(pending_query_interrupt_freq)
                               ->implicit_value(1000),
-                          "A frequency of checking the request of runtime query "
+                          "A frequency of checking the request of pending query "
                           "interrupt from user (in millisecond).");
+  help_desc.add_options()(
+      "running-query-interrupt-freq",
+      po::value<double>(&running_query_interrupt_freq)
+          ->default_value(running_query_interrupt_freq)
+          ->implicit_value(0.5),
+      "A frequency of checking the request of running query "
+      "interrupt from user (0.0 (less frequent) ~ (more frequent) 1.0).");
   help_desc.add_options()("use-estimator-result-cache",
                           po::value<bool>(&use_estimator_result_cache)
                               ->default_value(use_estimator_result_cache)
@@ -307,6 +321,22 @@ void CommandLineOptions::fillOptions() {
       "enable-fsi",
       po::value<bool>(&g_enable_fsi)->default_value(g_enable_fsi)->implicit_value(true),
       "Enable foreign storage interface.");
+  help_desc.add_options()("encryption-key-store",
+                          po::value<std::string>(&encryption_key_store_path),
+                          "Path to directory where encryption related keys will reside.");
+  help_desc.add_options()("disk-cache-level",
+                          po::value<std::string>(&(disk_cache_level))
+                              ->default_value("fsi")
+                              ->implicit_value("fsi"),
+                          "Specify level of disk cache.  Valid options are 'fsi', "
+                          "'non_fsi, 'none', and 'all'.");
+  help_desc.add_options()("disk-cache-path",
+                          po::value<std::string>(&disk_cache_config.path),
+                          "Specify the path for the disk cache.");
+  help_desc.add_options()(
+      "disk-cache-size-limit",
+      po::value<std::size_t>(&(disk_cache_config.size_limit)),
+      "Specify the maximum size of the the disk cache per table in bytes.");
 #endif  // ENABLE_FSI
   help_desc.add_options()(
       "enable-interoperability",
@@ -325,12 +355,23 @@ void CommandLineOptions::fillOptions() {
           ->default_value(system_parameters.calcite_timeout),
       "Calcite server timeout (milliseconds). Increase this on systems with frequent "
       "schema changes or when running large numbers of parallel queries.");
+  help_desc.add_options()("calcite-service-keepalive",
+                          po::value<size_t>(&system_parameters.calcite_keepalive)
+                              ->default_value(system_parameters.calcite_keepalive)
+                              ->implicit_value(true),
+                          "Enable keepalive on Calcite connections.");
   help_desc.add_options()(
       "stringdict-parallelizm",
       po::value<bool>(&g_enable_stringdict_parallel)
           ->default_value(g_enable_stringdict_parallel)
           ->implicit_value(true),
       "Allow StringDictionary to parallelize loads using multiple threads");
+  help_desc.add_options()("log-user-origin",
+                          po::value<bool>(&log_user_origin)
+                              ->default_value(log_user_origin)
+                              ->implicit_value(true),
+                          "Lookup the origin of inbound connections by IP address/DNS "
+                          "name, and print this information as part of stdlog.");
   help_desc.add(log_options_.get_options());
 }
 
@@ -574,6 +615,32 @@ void CommandLineOptions::fillAdvancedOptions() {
                                "Specify libgeos shared object filename to be used for "
                                "geos-backed geo opertations.");
 #endif
+  developer_desc.add_options()(
+      "large-ndv-threshold",
+      po::value<int64_t>(&g_large_ndv_threshold)->default_value(g_large_ndv_threshold));
+  developer_desc.add_options()(
+      "large-ndv-multiplier",
+      po::value<size_t>(&g_large_ndv_multiplier)->default_value(g_large_ndv_multiplier));
+  developer_desc.add_options()(
+      "bitmap-memory-limit",
+      po::value<int64_t>(&g_bitmap_memory_limit)->default_value(g_bitmap_memory_limit),
+      "Limit for count distinct bitmap memory use. The limit is computed by taking the "
+      "size of the group by buffer (entry count in Query Memory Descriptor) and "
+      "multiplying it by the number of count distinct expression and the size of bitmap "
+      "required for each. For approx_count_distinct this is typically 8192 bytes.");
+  developer_desc.add_options()(
+      "enable-filter-function",
+      po::value<bool>(&g_enable_filter_function)
+          ->default_value(g_enable_filter_function)
+          ->implicit_value(true),
+      "Enable the filter function protection feature for the SQL JIT compiler. "
+      "Normally should be on but techs might want to disable for troubleshooting.");
+  developer_desc.add_options()(
+      "enable-calcite-ddl",
+      po::value<bool>(&g_enable_calcite_ddl_parser)
+          ->default_value(g_enable_calcite_ddl_parser)
+          ->implicit_value(true),
+      "Enable using Calcite for supported DDL parsing when available.");
 }
 
 namespace {
@@ -604,6 +671,12 @@ bool trim_and_check_file_exists(std::string& filename, const std::string desc) {
     }
   }
   return true;
+}
+
+void addOptionalFileToBlacklist(std::string& filename) {
+  if (!filename.empty()) {
+    ddl_utils::FilePathBlacklist::addToBlacklist(filename);
+  }
 }
 
 }  // namespace
@@ -684,8 +757,10 @@ void CommandLineOptions::validate() {
   }
   LOG(INFO) << " Runtime query interrupt is set to " << enable_runtime_query_interrupt;
   if (enable_runtime_query_interrupt) {
-    LOG(INFO) << " A frequency of checking runtime query interrupt request is set to "
-              << runtime_query_interrupt_frequency << " (in ms.)";
+    LOG(INFO) << " A frequency of checking pending query interrupt request is set to "
+              << pending_query_interrupt_freq << " (in ms.)";
+    LOG(INFO) << " A frequency of checking running query interrupt request is set to "
+              << running_query_interrupt_freq << " (0.0 ~ 1.0)";
   }
 
   LOG(INFO) << " Debug Timer is set to " << g_enable_debug_timer;
@@ -699,10 +774,47 @@ void CommandLineOptions::validate() {
   ddl_utils::FilePathBlacklist::addToBlacklist(base_path + "/mapd_catalogs");
   ddl_utils::FilePathBlacklist::addToBlacklist(base_path + "/mapd_data");
   ddl_utils::FilePathBlacklist::addToBlacklist(base_path + "/mapd_log");
-  if (!license_path.empty()) {
-    ddl_utils::FilePathBlacklist::addToBlacklist(license_path);
+
+  if (disk_cache_level == "fsi") {
+    if (g_enable_fsi) {
+      disk_cache_config.enabled_level = DiskCacheLevel::fsi;
+      LOG(INFO) << "Disk cache enabled for foreign tables only";
+    } else {
+      LOG(INFO) << "Cannot enable disk cache for fsi when fsi is disabled.  Defaulted to "
+                   "disk cache disabled";
+    }
+  } else if (disk_cache_level == "all") {
+    disk_cache_config.enabled_level = DiskCacheLevel::all;
+    LOG(INFO) << "Disk cache enabled for all tables";
+  } else if (disk_cache_level == "non_fsi") {
+    disk_cache_config.enabled_level = DiskCacheLevel::non_fsi;
+    LOG(INFO) << "Disk cache enabled for non-FSI tables";
+  } else if (disk_cache_level == "none") {
+    disk_cache_config.enabled_level = DiskCacheLevel::none;
+    LOG(INFO) << "Disk cache disabled";
+  } else {
+    disk_cache_config.enabled_level = DiskCacheLevel::none;
+    LOG(INFO) << "Non-recognized value for disk-cache-level {" << disk_cache_level
+              << "}.  Defaulted to disk cache disabled";
   }
-  // TODO: add encryption cert path
+
+  if (disk_cache_config.path.empty()) {
+    disk_cache_config.path = base_path + "/omnisci_disk_cache";
+  }
+  ddl_utils::FilePathBlacklist::addToBlacklist(disk_cache_config.path);
+
+  ddl_utils::FilePathBlacklist::addToBlacklist("/etc/passwd");
+  ddl_utils::FilePathBlacklist::addToBlacklist("/etc/shadow");
+
+  // If passed in, blacklist all security config files
+  addOptionalFileToBlacklist(license_path);
+  addOptionalFileToBlacklist(system_parameters.ssl_cert_file);
+  addOptionalFileToBlacklist(authMetadata.ca_file_name);
+  addOptionalFileToBlacklist(system_parameters.ssl_trust_store);
+  addOptionalFileToBlacklist(system_parameters.ssl_keystore);
+  addOptionalFileToBlacklist(system_parameters.ssl_key_file);
+  addOptionalFileToBlacklist(system_parameters.ssl_trust_ca_file);
+  addOptionalFileToBlacklist(cluster_file);
 }
 
 boost::optional<int> CommandLineOptions::parse_command_line(
@@ -719,6 +831,27 @@ boost::optional<int> CommandLineOptions::parse_command_line(
                   .run(),
               vm);
     po::notify(vm);
+
+    if (vm.count("help")) {
+      std::cerr << "Usage: omnisci_server <data directory path> [-p <port number>] "
+                   "[--http-port <http port number>] [--flush-log] [--version|-v]"
+                << std::endl
+                << std::endl;
+      std::cout << help_desc << std::endl;
+      return 0;
+    }
+    if (vm.count("dev-options")) {
+      std::cout << "Usage: omnisci_server <data directory path> [-p <port number>] "
+                   "[--http-port <http port number>] [--flush-log] [--version|-v]"
+                << std::endl
+                << std::endl;
+      std::cout << developer_desc << std::endl;
+      return 0;
+    }
+    if (vm.count("version")) {
+      std::cout << "OmniSci Version: " << MAPD_RELEASE << std::endl;
+      return 0;
+    }
 
     if (vm.count("config")) {
       std::ifstream settings_file(system_parameters.config_file);
@@ -753,32 +886,12 @@ boost::optional<int> CommandLineOptions::parse_command_line(
       return 1;
     }
 
-    if (vm.count("help")) {
-      std::cerr << "Usage: omnisci_server <data directory path> [-p <port number>] "
-                   "[--http-port <http port number>] [--flush-log] [--version|-v]"
-                << std::endl
-                << std::endl;
-      std::cout << help_desc << std::endl;
-      return 0;
-    }
-    if (vm.count("dev-options")) {
-      std::cout << "Usage: omnisci_server <data directory path> [-p <port number>] "
-                   "[--http-port <http port number>] [--flush-log] [--version|-v]"
-                << std::endl
-                << std::endl;
-      std::cout << developer_desc << std::endl;
-      return 0;
-    }
-    if (vm.count("version")) {
-      std::cout << "OmniSci Version: " << MAPD_RELEASE << std::endl;
-      return 0;
-    }
-
     g_enable_watchdog = enable_watchdog;
     g_enable_dynamic_watchdog = enable_dynamic_watchdog;
     g_dynamic_watchdog_time_limit = dynamic_watchdog_time_limit;
     g_enable_runtime_query_interrupt = enable_runtime_query_interrupt;
-    g_runtime_query_interrupt_frequency = runtime_query_interrupt_frequency;
+    g_pending_query_interrupt_freq = pending_query_interrupt_freq;
+    g_running_query_interrupt_freq = running_query_interrupt_freq;
     g_use_estimator_result_cache = use_estimator_result_cache;
   } catch (po::error& e) {
     std::cerr << "Usage Error: " << e.what() << std::endl;
@@ -872,8 +985,6 @@ boost::optional<int> CommandLineOptions::parse_command_line(
   boost::algorithm::trim_if(authMetadata.ldapQueryUrl, boost::is_any_of("\"'"));
   boost::algorithm::trim_if(authMetadata.ldapRoleRegex, boost::is_any_of("\"'"));
   boost::algorithm::trim_if(authMetadata.ldapSuperUserRole, boost::is_any_of("\"'"));
-  boost::algorithm::trim_if(authMetadata.restToken, boost::is_any_of("\"'"));
-  boost::algorithm::trim_if(authMetadata.restUrl, boost::is_any_of("\"'"));
 
   return boost::none;
 }

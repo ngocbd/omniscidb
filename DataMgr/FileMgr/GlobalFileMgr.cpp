@@ -23,7 +23,6 @@
 #include "DataMgr/FileMgr/GlobalFileMgr.h"
 
 #include <fcntl.h>
-#include <unistd.h>
 #include <algorithm>
 #include <boost/filesystem.hpp>
 #include <boost/lexical_cast.hpp>
@@ -107,20 +106,6 @@ void GlobalFileMgr::deleteBuffersWithPrefix(const ChunkKey& keyPrefix, const boo
   }
 }
 
-void GlobalFileMgr::getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec) {
-  mapd_shared_lock<mapd_shared_mutex> read_lock(fileMgrs_mutex_);
-  ChunkMetadataVector chunkMetadataVecForFileMgr;
-  for (auto fileMgrsIt = allFileMgrs_.begin(); fileMgrsIt != allFileMgrs_.end();
-       ++fileMgrsIt) {
-    fileMgrsIt->second->getChunkMetadataVec(chunkMetadataVecForFileMgr);
-    while (!chunkMetadataVecForFileMgr.empty()) {
-      // norair - order of elements is reversed, consider optimising this later if needed
-      chunkMetadataVec.push_back(chunkMetadataVecForFileMgr.back());
-      chunkMetadataVecForFileMgr.pop_back();
-    }
-  }
-}
-
 AbstractBufferMgr* GlobalFileMgr::findFileMgr(const int db_id, const int tb_id) {
   // NOTE: only call this private function after locking is already in place
   AbstractBufferMgr* fm = nullptr;
@@ -172,6 +157,24 @@ AbstractBufferMgr* GlobalFileMgr::getFileMgr(const int db_id, const int tb_id) {
       return s.get();
     }
   }
+}
+
+// For testing purposes only
+std::shared_ptr<FileMgr> GlobalFileMgr::getSharedFileMgr(const int db_id,
+                                                         const int table_id) {
+  const auto table_key = std::make_pair(db_id, table_id);
+  if (ownedFileMgrs_.find(table_key) == ownedFileMgrs_.end()) {
+    return nullptr;
+  }
+  return ownedFileMgrs_[table_key];
+}
+
+// For testing purposes only
+void GlobalFileMgr::setFileMgr(const int db_id,
+                               const int table_id,
+                               std::shared_ptr<FileMgr> file_mgr) {
+  allFileMgrs_[{db_id, table_id}] = file_mgr.get();
+  ownedFileMgrs_[{db_id, table_id}] = file_mgr;
 }
 
 void GlobalFileMgr::writeFileMgrData(

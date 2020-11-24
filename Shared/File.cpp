@@ -20,14 +20,20 @@
  * @brief   Implementation of helper methods for File I/O.
  *
  */
-#include "File.h"
-#include <boost/filesystem.hpp>
+#include "Shared/File.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include "Logger.h"
+
+#include "Logger/Logger.h"
+#include "OSDependent/omnisci_fs.h"
 
 namespace File_Namespace {
 
@@ -43,13 +49,13 @@ FILE* create(const std::string& basePath,
                << "', Number of pages and page size must be positive integers. numPages "
                << numPages << " pageSize " << pageSize;
   }
-  FILE* f = fopen(path.c_str(), "w+b");
+  FILE* f = omnisci::fopen(path.c_str(), "w+b");
   if (f == nullptr) {
     LOG(FATAL) << "Error trying to create file '" << path
                << "', the error was: " << std::strerror(errno);
     ;
   }
-  fseek(f, (pageSize * numPages) - 1, SEEK_SET);
+  fseek(f, static_cast<long>((pageSize * numPages) - 1), SEEK_SET);
   fputc(EOF, f);
   fseek(f, 0, SEEK_SET);  // rewind
   if (fileSize(f) != pageSize * numPages) {
@@ -62,13 +68,13 @@ FILE* create(const std::string& basePath,
 }
 
 FILE* create(const std::string& fullPath, const size_t requestedFileSize) {
-  FILE* f = fopen(fullPath.c_str(), "w+b");
+  FILE* f = omnisci::fopen(fullPath.c_str(), "w+b");
   if (f == nullptr) {
     LOG(FATAL) << "Error trying to create file '" << fullPath
                << "', the error was:  " << std::strerror(errno);
     ;
   }
-  fseek(f, requestedFileSize - 1, SEEK_SET);
+  fseek(f, static_cast<long>(requestedFileSize - 1), SEEK_SET);
   fputc(EOF, f);
   fseek(f, 0, SEEK_SET);  // rewind
   if (fileSize(f) != requestedFileSize) {
@@ -81,7 +87,7 @@ FILE* create(const std::string& fullPath, const size_t requestedFileSize) {
 
 FILE* open(int fileId) {
   std::string s(std::to_string(fileId) + std::string(MAPD_FILE_EXT));
-  FILE* f = fopen(s.c_str(), "r+b");  // opens existing file for updates
+  FILE* f = omnisci::fopen(s.c_str(), "r+b");  // opens existing file for updates
   if (f == nullptr) {
     LOG(FATAL) << "Error trying to open file '" << s
                << "', the error was: " << std::strerror(errno);
@@ -90,7 +96,7 @@ FILE* open(int fileId) {
 }
 
 FILE* open(const std::string& path) {
-  FILE* f = fopen(path.c_str(), "r+b");  // opens existing file for updates
+  FILE* f = omnisci::fopen(path.c_str(), "r+b");  // opens existing file for updates
   if (f == nullptr) {
     LOG(FATAL) << "Error trying to open file '" << path
                << "', the errno was: " << std::strerror(errno);
@@ -111,7 +117,7 @@ bool removeFile(const std::string basePath, const std::string filename) {
 
 size_t read(FILE* f, const size_t offset, const size_t size, int8_t* buf) {
   // read "size" bytes from the offset location in the file into the buffer
-  CHECK_EQ(fseek(f, offset, SEEK_SET), 0);
+  CHECK_EQ(fseek(f, static_cast<long>(offset), SEEK_SET), 0);
   size_t bytesRead = fread(buf, sizeof(int8_t), size, f);
   CHECK_EQ(bytesRead, sizeof(int8_t) * size);
   return bytesRead;
@@ -119,7 +125,7 @@ size_t read(FILE* f, const size_t offset, const size_t size, int8_t* buf) {
 
 size_t write(FILE* f, const size_t offset, const size_t size, int8_t* buf) {
   // write size bytes from the buffer to the offset location in the file
-  if (fseek(f, offset, SEEK_SET) != 0) {
+  if (fseek(f, static_cast<long>(offset), SEEK_SET) != 0) {
     LOG(FATAL)
         << "Error trying to write to file (during positioning seek) the error was: "
         << std::strerror(errno);

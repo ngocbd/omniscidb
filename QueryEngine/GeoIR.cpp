@@ -14,22 +14,23 @@
  * limitations under the License.
  */
 
-#include "CodeGenerator.h"
-#include "Execute.h"
-#include "Shared/geo_compression.h"
+#include "Geospatial/Compression.h"
+#include "QueryEngine/CodeGenerator.h"
+#include "QueryEngine/Execute.h"
 
 std::vector<llvm::Value*> CodeGenerator::codegenGeoUOper(
     const Analyzer::GeoUOper* geo_expr,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (co.device_type == ExecutorDeviceType::GPU) {
-    if (geo_expr->getOp() != Geo_namespace::GeoBase::GeoOp::kPROJECTION) {
+    if (geo_expr->getOp() != Geospatial::GeoBase::GeoOp::kPROJECTION) {
       throw QueryMustRunOnCpu();
     }
   }
 
   auto argument_list = codegenGeoArgs(geo_expr->getArgs0(), co);
 
-  if (geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kPROJECTION) {
+  if (geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kPROJECTION) {
     return argument_list;
   }
 
@@ -40,9 +41,14 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoUOper(
   // Basic set of arguments is currently common to all Geos_* func invocations:
   // op kind, type of the first geo arg0, geo arg0 components
   std::string func = "Geos_Wkb"s;
-  if (geo_expr->getTypeInfo0().get_output_srid() !=
-      geo_expr->get_type_info().get_output_srid()) {
-    throw std::runtime_error("GEOS runtime doesn't support geometry transforms.");
+  if (geo_expr->getTypeInfo0().transforms()) {
+    throw std::runtime_error(
+        "GEOS runtime does not support transforms on geometry inputs.");
+  }
+  // Catch transforms applied to geometry construction only
+  if (geo_expr->get_type_info().transforms()) {
+    throw std::runtime_error(
+        "GEOS runtime does not support transforms on geometry outputs.");
   }
   // Prepend arg0 geo SQLType
   argument_list.insert(
@@ -61,15 +67,15 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoUOper(
   argument_list.insert(
       argument_list.end(),
       cgen_state_->llInt(static_cast<int>(
-          geospatial::get_compression_scheme(geo_expr->getTypeInfo0()))));
+          Geospatial::get_compression_scheme(geo_expr->getTypeInfo0()))));
   // Append geo expr SRID
   argument_list.insert(
       argument_list.end(),
       cgen_state_->llInt(static_cast<int>(geo_expr->getTypeInfo0().get_output_srid())));
 
   // Deal with unary geo predicates
-  if (geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kISEMPTY ||
-      geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kISVALID) {
+  if (geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kISEMPTY ||
+      geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kISVALID) {
     return codegenGeosPredicateCall(func, argument_list, co);
   }
 
@@ -80,6 +86,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoUOper(
 std::vector<llvm::Value*> CodeGenerator::codegenGeoBinOper(
     Analyzer::GeoBinOper const* geo_expr,
     CompilationOptions const& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (co.device_type == ExecutorDeviceType::GPU) {
     throw QueryMustRunOnCpu();
   }
@@ -92,9 +99,13 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoBinOper(
   // Basic set of arguments is currently common to all Geos_* func invocations:
   // op kind, type of the first geo arg0, geo arg0 components
   std::string func = "Geos_Wkb"s;
-  if (geo_expr->getTypeInfo0().get_output_srid() !=
-      geo_expr->get_type_info().get_output_srid()) {
-    throw std::runtime_error("GEOS runtime doesn't support geometry transforms.");
+  if (geo_expr->getTypeInfo0().transforms() || geo_expr->getTypeInfo1().transforms()) {
+    throw std::runtime_error(
+        "GEOS runtime does not support transforms on geometry inputs.");
+  }
+  if (geo_expr->get_type_info().transforms()) {
+    throw std::runtime_error(
+        "GEOS runtime does not support transforms on geometry outputs.");
   }
   // Prepend arg0 geo SQLType
   argument_list.insert(
@@ -113,7 +124,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoBinOper(
   argument_list.insert(
       argument_list.end(),
       cgen_state_->llInt(static_cast<int>(
-          geospatial::get_compression_scheme(geo_expr->getTypeInfo0()))));
+          Geospatial::get_compression_scheme(geo_expr->getTypeInfo0()))));
   // Append geo expr SRID
   argument_list.insert(
       argument_list.end(),
@@ -121,14 +132,10 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoBinOper(
 
   auto arg1_list = codegenGeoArgs(geo_expr->getArgs1(), co);
 
-  if (geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kDIFFERENCE ||
-      geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kINTERSECTION ||
-      geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kUNION) {
+  if (geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kDIFFERENCE ||
+      geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kINTERSECTION ||
+      geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kUNION) {
     func += "_Wkb"s;
-    if (geo_expr->getTypeInfo1().get_output_srid() !=
-        geo_expr->get_type_info().get_output_srid()) {
-      throw std::runtime_error("GEOS runtime doesn't support geometry transforms.");
-    }
     // Prepend arg1 geo SQLType
     arg1_list.insert(
         arg1_list.begin(),
@@ -142,11 +149,11 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoBinOper(
     // Append geo expr compression
     arg1_list.insert(arg1_list.end(),
                      cgen_state_->llInt(static_cast<int>(
-                         geospatial::get_compression_scheme(geo_expr->getTypeInfo1()))));
+                         Geospatial::get_compression_scheme(geo_expr->getTypeInfo1()))));
     // Append geo expr compression
     arg1_list.insert(arg1_list.end(),
                      cgen_state_->llInt(geo_expr->getTypeInfo1().get_output_srid()));
-  } else if (geo_expr->getOp() == Geo_namespace::GeoBase::GeoOp::kBUFFER) {
+  } else if (geo_expr->getOp() == Geospatial::GeoBase::GeoOp::kBUFFER) {
     // Extra argument in this case is double
     func += "_double"s;
   } else {
@@ -162,6 +169,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoBinOper(
 std::vector<llvm::Value*> CodeGenerator::codegenGeoArgs(
     const std::vector<std::shared_ptr<Analyzer::Expr>>& geo_args,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   std::vector<llvm::Value*> argument_list;
   bool coord_col = true;
   for (const auto& geo_arg : geo_args) {
@@ -194,7 +202,23 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeoArgs(
     } else {
       CHECK_EQ(size_t(1), arg_lvs.size());
       if (arg_ti.get_size() > 0) {
-        argument_list.emplace_back(arg_lvs.front());
+        // Set up the pointer lv for a dynamically generated point
+        auto ptr_lv = arg_lvs.front();
+        auto col_var = dynamic_cast<const Analyzer::ColumnVar*>(arg);
+        // Override for point coord column access
+        if (col_var) {
+          ptr_lv = cgen_state_->emitExternalCall(
+              "fast_fixlen_array_buff",
+              llvm::Type::getInt8PtrTy(cgen_state_->context_),
+              {arg_lvs.front(), posArg(arg)});
+        }
+        if (coord_col) {
+          coord_col = false;
+        } else {
+          ptr_lv = cgen_state_->ir_builder_.CreatePointerCast(
+              ptr_lv, llvm::Type::getInt32PtrTy(cgen_state_->context_));
+        }
+        argument_list.emplace_back(ptr_lv);
         argument_list.emplace_back(cgen_state_->llInt<int64_t>(arg_ti.get_size()));
       } else {
         auto ptr_lv =
@@ -227,6 +251,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeosPredicateCall(
     const std::string& func,
     std::vector<llvm::Value*> argument_list,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   auto i8_type = get_int_type(8, cgen_state_->context_);
   auto result = cgen_state_->ir_builder_.CreateAlloca(i8_type, nullptr, "result");
   argument_list.emplace_back(result);
@@ -239,9 +264,9 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeosPredicateCall(
   llvm::BasicBlock* geos_pred_ok_bb{nullptr};
   llvm::BasicBlock* geos_pred_fail_bb{nullptr};
   geos_pred_ok_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "geos_pred_ok_bb", cgen_state_->row_func_);
+      cgen_state_->context_, "geos_pred_ok_bb", cgen_state_->current_func_);
   geos_pred_fail_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "geos_pred_fail_bb", cgen_state_->row_func_);
+      cgen_state_->context_, "geos_pred_fail_bb", cgen_state_->current_func_);
   if (!status_lv) {
     status_lv = cgen_state_->llBool(false);
   }
@@ -258,6 +283,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeosConstructorCall(
     const std::string& func,
     std::vector<llvm::Value*> argument_list,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   // Create output buffer pointers, append pointers to output args to
   auto i8_type = get_int_type(8, cgen_state_->context_);
   auto i32_type = get_int_type(32, cgen_state_->context_);
@@ -296,9 +322,9 @@ std::vector<llvm::Value*> CodeGenerator::codegenGeosConstructorCall(
   llvm::BasicBlock* geos_ok_bb{nullptr};
   llvm::BasicBlock* geos_fail_bb{nullptr};
   geos_ok_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "geos_ok_bb", cgen_state_->row_func_);
+      cgen_state_->context_, "geos_ok_bb", cgen_state_->current_func_);
   geos_fail_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "geos_fail_bb", cgen_state_->row_func_);
+      cgen_state_->context_, "geos_fail_bb", cgen_state_->current_func_);
   if (!status_lv) {
     status_lv = cgen_state_->llBool(false);
   }

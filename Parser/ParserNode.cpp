@@ -37,6 +37,7 @@
 #include <cmath>
 #include <limits>
 #include <random>
+#include <regex>
 #include <stdexcept>
 #include <type_traits>
 #include <typeinfo>
@@ -48,24 +49,27 @@
 #include "Fragmenter/InsertOrderFragmenter.h"
 #include "Fragmenter/SortedOrderFragmenter.h"
 #include "Fragmenter/TargetValueConvertersFactories.h"
+#include "Geospatial/Compression.h"
+#include "Geospatial/Types.h"
 #include "ImportExport/Importer.h"
 #include "LockMgr/LockMgr.h"
 #include "QueryEngine/CalciteAdapter.h"
+#include "QueryEngine/CalciteDeserializerUtils.h"
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/ExtensionFunctionsWhitelist.h"
+#include "QueryEngine/JsonAccessors.h"
 #include "QueryEngine/RelAlgExecutor.h"
 #include "ReservedKeywords.h"
 #include "Shared/StringTransform.h"
-#include "Shared/TimeGM.h"
-#include "Shared/geo_compression.h"
-#include "Shared/geo_types.h"
-#include "Shared/mapd_glob.h"
 #include "Shared/measure.h"
 #include "Shared/shard_key.h"
 #include "TableArchiver/TableArchiver.h"
 #include "Utils/FsiUtils.h"
+
 #include "gen-cpp/CalciteServer.h"
 #include "parser.h"
+
+bool g_enable_calcite_ddl_parser{true};
 
 size_t g_leaf_count{0};
 bool g_test_drop_column_rollback{false};
@@ -1678,15 +1682,16 @@ void InsertValuesStmt::analyze(const Catalog_Namespace::Catalog& catalog,
         }
       }
       bool is_null = false;
-      std::string* wkt{nullptr};
+      std::string* geo_string{nullptr};
       if (c) {
         is_null = c->get_is_null();
         if (!is_null) {
-          wkt = c->get_constval().stringval;
+          geo_string = c->get_constval().stringval;
         }
       }
-      if (!is_null && !wkt) {
-        throw std::runtime_error("Expecting a WKT string for column " + cd->columnName);
+      if (!is_null && !geo_string) {
+        throw std::runtime_error("Expecting a WKT or WKB hex string for column " +
+                                 cd->columnName);
       }
       std::vector<double> coords;
       std::vector<double> bounds;
@@ -1696,8 +1701,8 @@ void InsertValuesStmt::analyze(const Catalog_Namespace::Catalog& catalog,
           0;  // @TODO simon.eves where to get render_group from in this context?!
       SQLTypeInfo import_ti{cd->columnType};
       if (!is_null) {
-        if (!Geo_namespace::GeoTypesFactory::getGeoColumns(
-                *wkt, import_ti, coords, bounds, ring_sizes, poly_rings)) {
+        if (!Geospatial::GeoTypesFactory::getGeoColumns(
+                *geo_string, import_ti, coords, bounds, ring_sizes, poly_rings)) {
           throw std::runtime_error("Cannot read geometry to insert into column " +
                                    cd->columnName);
         }
@@ -1733,7 +1738,7 @@ void InsertValuesStmt::analyze(const Catalog_Namespace::Catalog& catalog,
       CHECK_EQ(cd_coords->columnType.get_subtype(), kTINYINT);
       std::list<std::shared_ptr<Analyzer::Expr>> value_exprs;
       if (!is_null || cd->columnType.get_type() == kPOINT) {
-        auto compressed_coords = geospatial::compress_coords(coords, col_ti);
+        auto compressed_coords = Geospatial::compress_coords(coords, col_ti);
         for (auto cc : compressed_coords) {
           Datum d;
           d.tinyintval = cc;
@@ -2183,6 +2188,165 @@ void get_dataframe_definitions(DataframeTableDescriptor& df_td,
 
 }  // namespace
 
+CreateTableStmt::CreateTableStmt(const rapidjson::Value& payload) {
+  CHECK(payload.HasMember("name"));
+  table_ = std::make_unique<std::string>(json_str(payload["name"]));
+  CHECK(payload.HasMember("elements"));
+  CHECK(payload["elements"].IsArray());
+
+  // TODO: support temporary tables
+  is_temporary_ = false;
+
+  if_not_exists_ = false;
+  if (payload.HasMember("ifNotExists")) {
+    if_not_exists_ = json_bool(payload["ifNotExists"]);
+  }
+
+  const auto elements = payload["elements"].GetArray();
+  for (const auto& element : elements) {
+    CHECK(element.IsObject());
+    CHECK(element.HasMember("type"));
+    if (json_str(element["type"]) == "SQL_COLUMN_DECLARATION") {
+      CHECK(element.HasMember("name"));
+      auto col_name = std::make_unique<std::string>(json_str(element["name"]));
+      CHECK(element.HasMember("sqltype"));
+      const auto sql_types = to_sql_type(json_str(element["sqltype"]));
+
+      // decimal / numeric precision / scale
+      int precision = -1;
+      int scale = -1;
+      if (element.HasMember("precision")) {
+        precision = json_i64(element["precision"]);
+      }
+      if (element.HasMember("scale")) {
+        scale = json_i64(element["scale"]);
+      }
+
+      std::optional<int64_t> array_size;
+      if (element.HasMember("arraySize")) {
+        // We do not yet support geo arrays
+        array_size = json_i64(element["arraySize"]);
+      }
+      std::unique_ptr<SQLType> sql_type;
+      if (element.HasMember("subtype")) {
+        CHECK(element.HasMember("coordinateSystem"));
+        const auto subtype_sql_types = to_sql_type(json_str(element["subtype"]));
+        sql_type = std::make_unique<SQLType>(
+            subtype_sql_types,
+            static_cast<int>(sql_types),
+            static_cast<int>(json_i64(element["coordinateSystem"])),
+            false);
+      } else if (precision > 0 && scale > 0) {
+        sql_type = std::make_unique<SQLType>(sql_types,
+                                             precision,
+                                             scale,
+                                             /*is_array=*/array_size.has_value(),
+                                             array_size ? *array_size : -1);
+      } else if (precision > 0) {
+        sql_type = std::make_unique<SQLType>(sql_types,
+                                             precision,
+                                             0,
+                                             /*is_array=*/array_size.has_value(),
+                                             array_size ? *array_size : -1);
+      } else {
+        sql_type = std::make_unique<SQLType>(sql_types,
+                                             /*is_array=*/array_size.has_value(),
+                                             array_size ? *array_size : -1);
+      }
+      CHECK(sql_type);
+
+      CHECK(element.HasMember("nullable"));
+      const auto nullable = json_bool(element["nullable"]);
+      std::unique_ptr<ColumnConstraintDef> constraint_def;
+      if (!nullable) {
+        constraint_def = std::make_unique<ColumnConstraintDef>(/*notnull=*/true,
+                                                               /*unique=*/false,
+                                                               /*primarykey=*/false,
+                                                               /*defaultval=*/nullptr);
+      }
+      std::unique_ptr<CompressDef> compress_def;
+      if (element.HasMember("encodingType") && !element["encodingType"].IsNull()) {
+        std::string encoding_type = json_str(element["encodingType"]);
+        CHECK(element.HasMember("encodingSize"));
+        auto encoding_name =
+            std::make_unique<std::string>(json_str(element["encodingType"]));
+        compress_def = std::make_unique<CompressDef>(encoding_name.release(),
+                                                     json_i64(element["encodingSize"]));
+      }
+      auto col_def = std::make_unique<ColumnDef>(
+          col_name.release(),
+          sql_type.release(),
+          compress_def ? compress_def.release() : nullptr,
+          constraint_def ? constraint_def.release() : nullptr);
+      table_element_list_.emplace_back(std::move(col_def));
+    } else if (json_str(element["type"]) == "SQL_COLUMN_CONSTRAINT") {
+      CHECK(element.HasMember("name"));
+      if (json_str(element["name"]) == "SHARD_KEY") {
+        CHECK(element.HasMember("columns"));
+        CHECK(element["columns"].IsArray());
+        const auto& columns = element["columns"].GetArray();
+        if (columns.Size() != size_t(1)) {
+          throw std::runtime_error("Only one shard column is currently supported.");
+        }
+        auto shard_key_def = std::make_unique<ShardKeyDef>(json_str(columns[0]));
+        table_element_list_.emplace_back(std::move(shard_key_def));
+      } else if (json_str(element["name"]) == "SHARED_DICT") {
+        CHECK(element.HasMember("columns"));
+        CHECK(element["columns"].IsArray());
+        const auto& columns = element["columns"].GetArray();
+        if (columns.Size() != size_t(1)) {
+          throw std::runtime_error(
+              R"(Only one column per shared dictionary entry is currently supported. Use multiple SHARED DICT statements to share dictionaries from multiple columns.)");
+        }
+        CHECK(element.HasMember("references") && element["references"].IsObject());
+        const auto& references = element["references"].GetObject();
+        std::string references_table_name;
+        if (references.HasMember("table")) {
+          references_table_name = json_str(references["table"]);
+        } else {
+          references_table_name = *table_;
+        }
+        CHECK(references.HasMember("column"));
+
+        auto shared_dict_def = std::make_unique<SharedDictionaryDef>(
+            json_str(columns[0]), references_table_name, json_str(references["column"]));
+        table_element_list_.emplace_back(std::move(shared_dict_def));
+
+      } else {
+        LOG(FATAL) << "Unsupported type for SQL_COLUMN_CONSTRAINT: "
+                   << json_str(element["name"]);
+      }
+    } else {
+      LOG(FATAL) << "Unsupported element type for CREATE TABLE: "
+                 << element["type"].GetString();
+    }
+  }
+
+  CHECK(payload.HasMember("options"));
+  if (payload["options"].IsObject()) {
+    for (const auto& option : payload["options"].GetObject()) {
+      auto option_name = std::make_unique<std::string>(json_str(option.name));
+      std::unique_ptr<Literal> literal_value;
+      if (option.value.IsString()) {
+        auto literal_string = std::make_unique<std::string>(json_str(option.value));
+        literal_value = std::make_unique<StringLiteral>(literal_string.release());
+      } else if (option.value.IsInt() || option.value.IsInt64()) {
+        literal_value = std::make_unique<IntLiteral>(json_i64(option.value));
+      } else if (option.value.IsNull()) {
+        literal_value = std::make_unique<NullLiteral>();
+      } else {
+        throw std::runtime_error("Unable to handle literal for " + *option_name);
+      }
+      CHECK(literal_value);
+
+      storage_options_.emplace_back(std::make_unique<NameValueAssign>(
+          option_name.release(), literal_value.release()));
+    }
+  } else {
+    CHECK(payload["options"].IsNull());
+  }
+}
+
 void CreateTableStmt::executeDryRun(const Catalog_Namespace::SessionInfo& session,
                                     TableDescriptor& td,
                                     std::list<ColumnDescriptor>& columns,
@@ -2476,17 +2640,17 @@ void LocalConnector::insertDataToLeaf(const Catalog_Namespace::SessionInfo& sess
 }
 
 void LocalConnector::checkpoint(const Catalog_Namespace::SessionInfo& session,
-                                int tableId) {
+                                int table_id) {
   auto& catalog = session.getCatalog();
-  auto dbId = catalog.getCurrentDB().dbId;
-  catalog.getDataMgr().checkpoint(dbId, tableId);
+  catalog.checkpointWithAutoRollback(table_id);
 }
 
 void LocalConnector::rollback(const Catalog_Namespace::SessionInfo& session,
-                              int tableId) {
+                              int table_id) {
   auto& catalog = session.getCatalog();
-  auto dbId = catalog.getCurrentDB().dbId;
-  catalog.getDataMgr().checkpoint(dbId, tableId);
+  auto db_id = catalog.getDatabaseId();
+  auto table_epochs = catalog.getTableEpochs(db_id, table_id);
+  catalog.setTableEpochs(db_id, table_epochs);
 }
 
 std::list<ColumnDescriptor> LocalConnector::getColumnDescriptors(AggregatedResult& result,
@@ -2615,14 +2779,20 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
           &(*std::next(source_column_descriptors.begin(), i));
       const ColumnDescriptor* target_cd = target_column_descriptors.at(i);
 
-      if ((!source_cd->columnType.is_integer() && !target_cd->columnType.is_integer()) &&
-          (!source_cd->columnType.is_string() && !target_cd->columnType.is_string()) &&
-          (source_cd->columnType.get_type() != target_cd->columnType.get_type())) {
-        throw std::runtime_error("Source '" + source_cd->columnName + " " +
-                                 source_cd->columnType.get_type_name() +
-                                 "' and target '" + target_cd->columnName + " " +
-                                 target_cd->columnType.get_type_name() +
-                                 "' column types do not match.");
+      if (source_cd->columnType.get_type() != target_cd->columnType.get_type()) {
+        auto type_cannot_be_cast = [](const auto& col_type) {
+          return (col_type.is_time() || col_type.is_geometry() || col_type.is_array() ||
+                  col_type.is_boolean());
+        };
+
+        if (type_cannot_be_cast(source_cd->columnType) ||
+            type_cannot_be_cast(target_cd->columnType)) {
+          throw std::runtime_error("Source '" + source_cd->columnName + " " +
+                                   source_cd->columnType.get_type_name() +
+                                   "' and target '" + target_cd->columnName + " " +
+                                   target_cd->columnType.get_type_name() +
+                                   "' column types do not match.");
+        }
       }
       if (source_cd->columnType.is_array()) {
         if (source_cd->columnType.get_subtype() != target_cd->columnType.get_subtype()) {
@@ -2654,6 +2824,13 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
       }
 
       if (source_cd->columnType.is_string()) {
+        if (!target_cd->columnType.is_string()) {
+          throw std::runtime_error("Source '" + source_cd->columnName + " " +
+                                   source_cd->columnType.get_type_name() +
+                                   "' and target '" + target_cd->columnName + " " +
+                                   target_cd->columnType.get_type_name() +
+                                   "' column types do not match.");
+        }
         if (source_cd->columnType.get_compression() !=
             target_cd->columnType.get_compression()) {
           throw std::runtime_error("Source '" + source_cd->columnName + " " +
@@ -2706,133 +2883,133 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
 
   size_t outer_frag_end = outer_frag_count == 0 ? 1 : outer_frag_count;
 
-  for (size_t outer_frag_idx = 0; outer_frag_idx < outer_frag_end; outer_frag_idx++) {
-    std::vector<size_t> allowed_outer_fragment_indices;
+  try {
+    for (size_t outer_frag_idx = 0; outer_frag_idx < outer_frag_end; outer_frag_idx++) {
+      std::vector<size_t> allowed_outer_fragment_indices;
 
-    if (outer_frag_count) {
-      allowed_outer_fragment_indices.push_back(outer_frag_idx);
-    }
-
-    const auto query_clock_begin = timer_start();
-    std::vector<AggregatedResult> query_results = leafs_connector_->query(
-        query_state_proxy, select_query_, allowed_outer_fragment_indices);
-    total_source_query_time_ms += timer_stop(query_clock_begin);
-
-    for (auto& res : query_results) {
-      auto result_rows = res.rs;
-      result_rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
-      const auto num_rows = result_rows->rowCount();
-
-      if (0 == num_rows) {
-        continue;
+      if (outer_frag_count) {
+        allowed_outer_fragment_indices.push_back(outer_frag_idx);
       }
 
-      total_row_count += num_rows;
+      const auto query_clock_begin = timer_start();
+      std::vector<AggregatedResult> query_results = leafs_connector_->query(
+          query_state_proxy, select_query_, allowed_outer_fragment_indices);
+      total_source_query_time_ms += timer_stop(query_clock_begin);
 
-      size_t leaf_count = leafs_connector_->leafCount();
+      for (auto& res : query_results) {
+        auto result_rows = res.rs;
+        result_rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
+        const auto num_rows = result_rows->rowCount();
 
-      size_t max_number_of_rows_per_package =
-          std::min(num_rows / leaf_count, 64UL * 1024UL);
+        if (0 == num_rows) {
+          continue;
+        }
 
-      size_t start_row = 0;
-      size_t num_rows_to_process = std::min(num_rows, max_number_of_rows_per_package);
+        total_row_count += num_rows;
 
-      // ensure that at least one row is being processed
-      num_rows_to_process = std::max(num_rows_to_process, 1UL);
+        size_t leaf_count = leafs_connector_->leafCount();
 
-      std::vector<std::unique_ptr<TargetValueConverter>> value_converters;
+        size_t max_number_of_rows_per_package =
+            std::min(num_rows / leaf_count, 64UL * 1024UL);
 
-      TargetValueConverterFactory factory;
+        size_t start_row = 0;
+        size_t num_rows_to_process = std::min(num_rows, max_number_of_rows_per_package);
 
-      const int num_worker_threads = std::thread::hardware_concurrency();
+        // ensure that at least one row is being processed
+        num_rows_to_process = std::max(num_rows_to_process, 1UL);
 
-      std::vector<size_t> thread_start_idx(num_worker_threads),
-          thread_end_idx(num_worker_threads);
-      bool can_go_parallel = !result_rows->isTruncated() && num_rows_to_process > 20000;
+        std::vector<std::unique_ptr<TargetValueConverter>> value_converters;
 
-      std::atomic<size_t> row_idx{0};
+        TargetValueConverterFactory factory;
 
-      auto convert_function = [&result_rows,
-                               &value_converters,
-                               &row_idx,
-                               &num_rows_to_process,
-                               &thread_start_idx,
-                               &thread_end_idx](const int thread_id) {
-        const int num_cols = value_converters.size();
-        const size_t start = thread_start_idx[thread_id];
-        const size_t end = thread_end_idx[thread_id];
-        size_t idx = 0;
-        for (idx = start; idx < end; ++idx) {
-          const auto result_row = result_rows->getRowAtNoTranslations(idx);
-          if (!result_row.empty()) {
+        const int num_worker_threads = std::thread::hardware_concurrency();
+
+        std::vector<size_t> thread_start_idx(num_worker_threads),
+            thread_end_idx(num_worker_threads);
+        bool can_go_parallel = !result_rows->isTruncated() && num_rows_to_process > 20000;
+
+        std::atomic<size_t> row_idx{0};
+
+        auto convert_function = [&result_rows,
+                                 &value_converters,
+                                 &row_idx,
+                                 &num_rows_to_process,
+                                 &thread_start_idx,
+                                 &thread_end_idx](const int thread_id) {
+          const int num_cols = value_converters.size();
+          const size_t start = thread_start_idx[thread_id];
+          const size_t end = thread_end_idx[thread_id];
+          size_t idx = 0;
+          for (idx = start; idx < end; ++idx) {
+            const auto result_row = result_rows->getRowAtNoTranslations(idx);
+            if (!result_row.empty()) {
+              size_t target_row = row_idx.fetch_add(1);
+
+              if (target_row >= num_rows_to_process) {
+                break;
+              }
+
+              for (unsigned int col = 0; col < num_cols; col++) {
+                const auto& mapd_variant = result_row[col];
+                value_converters[col]->convertToColumnarFormat(target_row, &mapd_variant);
+              }
+            }
+          }
+
+          thread_start_idx[thread_id] = idx;
+        };
+
+        auto single_threaded_convert_function = [&result_rows,
+                                                 &value_converters,
+                                                 &row_idx,
+                                                 &num_rows_to_process,
+                                                 &thread_start_idx,
+                                                 &thread_end_idx](const int thread_id) {
+          const int num_cols = value_converters.size();
+          const size_t start = thread_start_idx[thread_id];
+          const size_t end = thread_end_idx[thread_id];
+          size_t idx = 0;
+          for (idx = start; idx < end; ++idx) {
             size_t target_row = row_idx.fetch_add(1);
 
             if (target_row >= num_rows_to_process) {
               break;
             }
-
+            const auto result_row = result_rows->getNextRow(false, false);
+            CHECK(!result_row.empty());
             for (unsigned int col = 0; col < num_cols; col++) {
               const auto& mapd_variant = result_row[col];
               value_converters[col]->convertToColumnarFormat(target_row, &mapd_variant);
             }
           }
-        }
 
-        thread_start_idx[thread_id] = idx;
-      };
+          thread_start_idx[thread_id] = idx;
+        };
 
-      auto single_threaded_convert_function = [&result_rows,
-                                               &value_converters,
-                                               &row_idx,
-                                               &num_rows_to_process,
-                                               &thread_start_idx,
-                                               &thread_end_idx](const int thread_id) {
-        const int num_cols = value_converters.size();
-        const size_t start = thread_start_idx[thread_id];
-        const size_t end = thread_end_idx[thread_id];
-        size_t idx = 0;
-        for (idx = start; idx < end; ++idx) {
-          size_t target_row = row_idx.fetch_add(1);
-
-          if (target_row >= num_rows_to_process) {
-            break;
+        if (can_go_parallel) {
+          const size_t entryCount = result_rows->entryCount();
+          for (size_t i = 0,
+                      start_entry = 0,
+                      stride = (entryCount + num_worker_threads - 1) / num_worker_threads;
+               i < num_worker_threads && start_entry < entryCount;
+               ++i, start_entry += stride) {
+            const auto end_entry = std::min(start_entry + stride, entryCount);
+            thread_start_idx[i] = start_entry;
+            thread_end_idx[i] = end_entry;
           }
-          const auto result_row = result_rows->getNextRow(false, false);
-          CHECK(!result_row.empty());
-          for (unsigned int col = 0; col < num_cols; col++) {
-            const auto& mapd_variant = result_row[col];
-            value_converters[col]->convertToColumnarFormat(target_row, &mapd_variant);
-          }
+
+        } else {
+          thread_start_idx[0] = 0;
+          thread_end_idx[0] = result_rows->entryCount();
         }
 
-        thread_start_idx[thread_id] = idx;
-      };
+        std::shared_ptr<Executor> executor;
 
-      if (can_go_parallel) {
-        const size_t entryCount = result_rows->entryCount();
-        for (size_t i = 0,
-                    start_entry = 0,
-                    stride = (entryCount + num_worker_threads - 1) / num_worker_threads;
-             i < num_worker_threads && start_entry < entryCount;
-             ++i, start_entry += stride) {
-          const auto end_entry = std::min(start_entry + stride, entryCount);
-          thread_start_idx[i] = start_entry;
-          thread_end_idx[i] = end_entry;
+        if (g_enable_experimental_string_functions) {
+          executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
         }
 
-      } else {
-        thread_start_idx[0] = 0;
-        thread_end_idx[0] = result_rows->entryCount();
-      }
-
-      std::shared_ptr<Executor> executor;
-
-      if (g_enable_experimental_string_functions) {
-        executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
-      }
-
-      while (start_row < num_rows) {
-        try {
+        while (start_row < num_rows) {
           value_converters.clear();
           row_idx = 0;
           int colNum = 0;
@@ -2911,25 +3088,20 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
           insertDataLoader.insertData(*session, insert_data);
           total_data_load_time_ms += timer_stop(data_load_clock_begin);
 
-        } catch (...) {
-          try {
-            if (td->nShards) {
-              const auto shard_tables = catalog.getPhysicalTablesDescriptors(td);
-              for (const auto ptd : shard_tables) {
-                leafs_connector_->rollback(*session, ptd->tableId);
-              }
-            }
-            leafs_connector_->rollback(*session, td->tableId);
-          } catch (...) {
-            // eat it
-          }
-          throw;
+          start_row += num_rows_to_process;
+          num_rows_to_process =
+              std::min(num_rows - start_row, max_number_of_rows_per_package);
         }
-        start_row += num_rows_to_process;
-        num_rows_to_process =
-            std::min(num_rows - start_row, max_number_of_rows_per_package);
       }
     }
+  } catch (...) {
+    try {
+      leafs_connector_->rollback(*session, td->tableId);
+    } catch (std::exception& e) {
+      LOG(ERROR) << "An error occurred during ITAS rollback attempt. Table id: "
+                 << td->tableId << ", Error: " << e.what();
+    }
+    throw;
   }
 
   int64_t total_time_ms = total_source_query_time_ms +
@@ -2943,12 +3115,6 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
           << "ms)\nquery: " << select_query_;
 
   if (!is_temporary) {
-    if (td->nShards) {
-      const auto shard_tables = catalog.getPhysicalTablesDescriptors(td);
-      for (const auto ptd : shard_tables) {
-        leafs_connector_->checkpoint(*session, ptd->tableId);
-      }
-    }
     leafs_connector_->checkpoint(*session, td->tableId);
   }
 }
@@ -3129,7 +3295,7 @@ void DropTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
                              " will not be dropped. User has no proper privileges.");
   }
 
-  ddl_utils::validate_drop_table_type(td, ddl_utils::TableType::TABLE);
+  ddl_utils::validate_table_type(td, ddl_utils::TableType::TABLE, "DROP");
 
   auto table_data_write_lock =
       lockmgr::TableDataLockMgr::getWriteLockForTable(catalog, *table);
@@ -3142,8 +3308,8 @@ void DropTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
 void TruncateTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   auto& catalog = session.getCatalog();
 
-  // TODO: Removal of the FileMgr is not thread safe. Take a global system write lock when
-  // truncating a table
+  // TODO: Removal of the FileMgr is not thread safe. Take a global system write lock
+  // when truncating a table
   const auto execute_write_lock = mapd_unique_lock<mapd_shared_mutex>(
       *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
           legacylockmgr::ExecutorOuterLock, true));
@@ -3171,6 +3337,7 @@ void TruncateTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   if (td->isView) {
     throw std::runtime_error(*table + " is a view.  Cannot Truncate.");
   }
+  foreign_storage::validate_non_foreign_table_write(td);
   auto table_data_write_lock =
       lockmgr::TableDataLockMgr::getWriteLockForTable(catalog, *table);
   catalog.truncateTable(td);
@@ -3401,13 +3568,13 @@ void AddColumnStmt::execute(const Catalog_Namespace::SessionInfo& session) {
                 std::vector<int> ring_sizes, poly_rings;
                 int render_group = 0;
                 SQLTypeInfo tinfo{cd->columnType};
-                if (!Geo_namespace::GeoTypesFactory::getGeoColumns(defaultval,
-                                                                   tinfo,
-                                                                   coords,
-                                                                   bounds,
-                                                                   ring_sizes,
-                                                                   poly_rings,
-                                                                   false)) {
+                if (!Geospatial::GeoTypesFactory::getGeoColumns(defaultval,
+                                                                tinfo,
+                                                                coords,
+                                                                bounds,
+                                                                ring_sizes,
+                                                                poly_rings,
+                                                                false)) {
                   throw std::runtime_error("Bad geometry data: '" + defaultval + "'");
                 }
                 size_t col_idx = 1 + std::distance(import_buffers.begin(), it);
@@ -3560,8 +3727,8 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
   boost::regex non_local_file_regex{R"(^\s*(s3|http|https)://.+)",
                                     boost::regex::extended | boost::regex::icase};
   if (!boost::regex_match(*file_pattern, non_local_file_regex)) {
-    ddl_utils::validate_allowed_file_path(*file_pattern,
-                                          ddl_utils::DataTransferType::IMPORT);
+    ddl_utils::validate_allowed_file_path(
+        *file_pattern, ddl_utils::DataTransferType::IMPORT, true);
   }
 
   size_t rows_completed = 0;
@@ -3626,7 +3793,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
         if (int_literal == nullptr) {
           throw std::runtime_error("buffer_size option must be an integer.");
         }
-        copy_params.buffer_size = std::max<size_t>(1 << 20, int_literal->get_intval());
+        copy_params.buffer_size = int_literal->get_intval();
       } else if (boost::iequals(*p->get_name(), "threads")) {
         const IntLiteral* int_literal = dynamic_cast<const IntLiteral*>(p->get_value());
         if (int_literal == nullptr) {
@@ -4080,6 +4247,10 @@ static std::pair<AccessPrivileges, DBObjectType> parseStringPrivs(
            {AccessPrivileges::DROP_SERVER, ServerDBObjectType}},
           {{"DROP"s, ServerDBObjectType},
            {AccessPrivileges::DROP_SERVER, ServerDBObjectType}},
+          {{"ALTER SERVER"s, DatabaseDBObjectType},
+           {AccessPrivileges::ALTER_SERVER, ServerDBObjectType}},
+          {{"ALTER"s, ServerDBObjectType},
+           {AccessPrivileges::ALTER_SERVER, ServerDBObjectType}},
 
           {{"VIEW SQL EDITOR"s, DatabaseDBObjectType},
            {AccessPrivileges::VIEW_SQL_EDITOR, DatabaseDBObjectType}},
@@ -4312,7 +4483,7 @@ void ShowCreateTableStmt::execute(const Catalog_Namespace::SessionInfo& session)
           legacylockmgr::ExecutorOuterLock, true));
 
   auto& catalog = session.getCatalog();
-  const TableDescriptor* td = catalog.getMetadataForTable(*table_);
+  const TableDescriptor* td = catalog.getMetadataForTable(*table_, false);
   if (!td) {
     throw std::runtime_error("Table/View " + *table_ + " does not exist.");
   }
@@ -4326,8 +4497,8 @@ void ShowCreateTableStmt::execute(const Catalog_Namespace::SessionInfo& session)
   }
   if (td->isView && !session.get_currentUser().isSuper) {
     // TODO: we need to run a validate query to ensure the user has access to the
-    // underlying table, but we do not have any of the machinery in here. Disable for now,
-    // unless the current user is a super user.
+    // underlying table, but we do not have any of the machinery in here. Disable for
+    // now, unless the current user is a super user.
     throw std::runtime_error("SHOW CREATE TABLE not yet supported for views");
   }
 
@@ -4575,6 +4746,25 @@ void ExportQueryStmt::parseOptions(
   }
 }
 
+CreateViewStmt::CreateViewStmt(const rapidjson::Value& payload) {
+  CHECK(payload.HasMember("name"));
+  view_name_ = json_str(payload["name"]);
+
+  if_not_exists_ = false;
+  if (payload.HasMember("ifNotExists")) {
+    if_not_exists_ = json_bool(payload["ifNotExists"]);
+  }
+
+  CHECK(payload.HasMember("query"));
+  select_query_ = json_str(payload["query"]);
+  std::regex newline_re("\\n");
+  select_query_ = std::regex_replace(select_query_, newline_re, " ");
+  // ensure a trailing semicolon is present on the select query
+  if (select_query_.back() != ';') {
+    select_query_.push_back(';');
+  }
+}
+
 void CreateViewStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   auto session_copy = session;
   auto session_ptr = std::shared_ptr<Catalog_Namespace::SessionInfo>(
@@ -4659,7 +4849,7 @@ void DropViewStmt::execute(const Catalog_Namespace::SessionInfo& session) {
                              " will not be dropped. User has no drop view privileges.");
   }
 
-  ddl_utils::validate_drop_table_type(td, ddl_utils::TableType::VIEW);
+  ddl_utils::validate_table_type(td, ddl_utils::TableType::VIEW, "DROP");
   catalog.dropTable(td);
 }
 
@@ -4874,6 +5064,32 @@ void RestoreTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
     }
     TableArchiver table_archiver(&catalog);
     table_archiver.restoreTable(session, *table, *path, compression);
+  }
+}
+
+void execute_calcite_ddl(
+    const std::string& ddl_statement,
+    std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr) {
+  CHECK(!ddl_statement.empty());
+  VLOG(2) << "Parsing JSON DDL from Calcite: " << ddl_statement;
+  rapidjson::Document ddl_query;
+  ddl_query.Parse(ddl_statement);
+  CHECK(ddl_query.IsObject());
+  CHECK(ddl_query.HasMember("payload"));
+  CHECK(ddl_query["payload"].IsObject());
+  const auto& payload = ddl_query["payload"].GetObject();
+  CHECK(payload.HasMember("command"));
+  CHECK(payload["command"].IsString());
+
+  const auto& ddl_command = std::string_view(payload["command"].GetString());
+  if (ddl_command == "CREATE_TABLE") {
+    auto create_table_stmt = Parser::CreateTableStmt(payload);
+    create_table_stmt.execute(*session_ptr);
+  } else if (ddl_command == "CREATE_VIEW") {
+    auto create_view_stmt = Parser::CreateViewStmt(payload);
+    create_view_stmt.execute(*session_ptr);
+  } else {
+    throw std::runtime_error("Unsupported DDL command");
   }
 }
 

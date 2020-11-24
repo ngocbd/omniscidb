@@ -51,7 +51,6 @@
 #include "Catalog/TableDescriptor.h"
 #include "Catalog/Types.h"
 #include "DataMgr/DataMgr.h"
-#include "LockMgr/LockMgrImpl.h"
 #include "QueryEngine/CompilationOptions.h"
 #include "Shared/mapd_shared_mutex.h"
 #include "SqliteConnector/SqliteConnector.h"
@@ -76,6 +75,18 @@ class TableArchiver;
   (SPIMAP_MAGIC1 + (unsigned)(SPIMAP_MAGIC2 * ((c) + 1) + (i)))
 
 namespace Catalog_Namespace {
+struct TableEpochInfo {
+  int32_t table_id, table_epoch, leaf_index{-1};
+
+  TableEpochInfo(const int32_t table_id_param, const int32_t table_epoch_param)
+      : table_id(table_id_param), table_epoch(table_epoch_param) {}
+  TableEpochInfo(const int32_t table_id_param,
+                 const int32_t table_epoch_param,
+                 const size_t leaf_index_param)
+      : table_id(table_id_param)
+      , table_epoch(table_epoch_param)
+      , leaf_index(leaf_index_param) {}
+};
 
 /**
  * @type Catalog
@@ -130,6 +141,7 @@ class Catalog final {
   void addColumn(const TableDescriptor& td, ColumnDescriptor& cd);
   void dropColumn(const TableDescriptor& td, const ColumnDescriptor& cd);
   void removeChunks(const int table_id);
+  void removeFragmenterForTable(const int table_id);
 
   const std::map<int, const ColumnDescriptor*> getDictionaryToColumnMapping();
 
@@ -166,6 +178,10 @@ class Catalog final {
 
   const LinkDescriptor* getMetadataForLink(const std::string& link) const;
   const LinkDescriptor* getMetadataForLink(int linkId) const;
+
+  const foreign_storage::ForeignTable* getForeignTableUnlocked(int tableId) const;
+
+  const foreign_storage::ForeignTable* getForeignTable(int table_id) const;
 
   /**
    * @brief Returns a list of pointers to constant ColumnDescriptor structs for all the
@@ -220,6 +236,15 @@ class Catalog final {
 
   int32_t getTableEpoch(const int32_t db_id, const int32_t table_id) const;
   void setTableEpoch(const int db_id, const int table_id, const int new_epoch);
+
+  std::vector<TableEpochInfo> getTableEpochs(const int32_t db_id,
+                                             const int32_t table_id) const;
+  void setTableEpochs(const int32_t db_id,
+                      const std::vector<TableEpochInfo>& table_epochs);
+
+  void setTableEpochsLogExceptions(const int32_t db_id,
+                                   const std::vector<TableEpochInfo>& table_epochs);
+
   int getDatabaseId() const { return currentDB_.dbId; }
   SqliteConnector& getSqliteConnector() { return sqliteConnector_; }
   void roll(const bool forward);
@@ -231,6 +256,7 @@ class Catalog final {
   static void set(const std::string& dbName, std::shared_ptr<Catalog> cat);
   static std::shared_ptr<Catalog> get(const std::string& dbName);
   static std::shared_ptr<Catalog> get(const int32_t db_id);
+  static std::shared_ptr<Catalog> checkedGet(const int32_t db_id);
   static std::shared_ptr<Catalog> get(const std::string& basePath,
                                       const DBMetadata& curDB,
                                       std::shared_ptr<Data_Namespace::DataMgr> dataMgr,
@@ -247,6 +273,7 @@ class Catalog final {
   void setDeletedColumnUnlocked(const TableDescriptor* td, const ColumnDescriptor* cd);
   int getLogicalTableId(const int physicalTableId) const;
   void checkpoint(const int logicalTableId) const;
+  void checkpointWithAutoRollback(const int logical_table_id);
   std::string name() const { return getCurrentDB().dbName; }
   void eraseDBData();
   void eraseTablePhysicalData(const TableDescriptor* td);
@@ -313,6 +340,18 @@ class Catalog final {
    */
   const std::unique_ptr<const foreign_storage::ForeignServer> getForeignServerFromStorage(
       const std::string& server_name);
+
+  /**
+   * Gets a pointer to a struct containing foreign table details fetched from storage.
+   * This is mainly used for testing when asserting that expected catalog data is
+   * persisted.
+   *
+   * @param table_name - Name of foreign table whose details will be fetched
+   * @return pointer to a struct containing foreign table details. nullptr is returned if
+   * no foreign table exists with the given name
+   */
+  const std::unique_ptr<const foreign_storage::ForeignTable> getForeignTableFromStorage(
+      int table_id);
 
   /**
    * Change the owner of a Foreign Server to a new owner.
@@ -386,6 +425,33 @@ class Catalog final {
    * @return true if table or view with name does not exist. Otherwise, return false
    */
   bool validateNonExistentTableOrView(const std::string& name, const bool if_not_exists);
+
+  /**
+   * Gets all the foreign tables that are pending refreshes. The list of tables
+   * includes tables that are configured for scheduled refreshes with next
+   * refresh timestamps that are in the past.
+   *
+   * @return foreign tables pending refreshes
+   */
+  std::vector<const TableDescriptor*> getAllForeignTablesForRefresh() const;
+
+  /**
+   * Updates the last and next (if applicable) refresh times of the foreign table
+   * with the given table id.
+   *
+   * @param table_id - id of table to apply updates to
+   */
+  void updateForeignTableRefreshTimes(const int32_t table_id);
+
+  /**
+   * Set the options of a Foreign Table.
+   *
+   * @param table_name - Name of the foreign table whose options will be set
+   * @param options - Options to set
+   */
+  void setForeignTableOptions(const std::string& table_name,
+                              foreign_storage::OptionsMap& options_map,
+                              bool clear_existing_options = true);
 
  protected:
   void CheckAndExecuteMigrations();
@@ -505,6 +571,10 @@ class Catalog final {
                                 const std::string& property,
                                 const std::string& value);
 
+  void setForeignTableProperty(const foreign_storage::ForeignTable* table,
+                               const std::string& property,
+                               const std::string& value);
+
   /**
    * Same as createForeignServer() but without acquiring locks. This should only be called
    * from within a function/code block that already acquires appropriate locks.
@@ -512,6 +582,9 @@ class Catalog final {
   void createForeignServerNoLocks(
       std::unique_ptr<foreign_storage::ForeignServer> foreign_server,
       bool if_not_exists);
+
+  foreign_storage::ForeignTable* getForeignTableUnlocked(
+      const std::string& tableName) const;
 
  public:
   mutable std::mutex sqliteMutex_;

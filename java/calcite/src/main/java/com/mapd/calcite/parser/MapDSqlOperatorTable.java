@@ -162,7 +162,13 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     // using reflection when we are deserializing from JSON.
     // opTab.addOperator(new RampFunction());
     // opTab.addOperator(new DedupFunction());
-    opTab.addOperator(new RowCopier()); // UDTF prototype
+    opTab.addOperator(new RowCopier()); // UDTF prototype, copy column to output column
+    opTab.addOperator(new RowAdder()); // UDTF prototype, add two columns to output column
+    opTab.addOperator(
+            new RowAddSub()); // UDTF prototype, add two columns to output column
+    opTab.addOperator(new GetMaxWithRowOffset()); // UDTF prototype, constant sized with 1
+                                                  // output row, get max of column along
+                                                  // with row offset as two columns
     opTab.addOperator(new MyUDFFunction());
     opTab.addOperator(new PgUnnest());
     opTab.addOperator(new Any());
@@ -216,6 +222,7 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     opTab.addOperator(new ST_SRID());
     opTab.addOperator(new ST_SetSRID());
     opTab.addOperator(new ST_Point());
+    opTab.addOperator(new ST_Centroid());
     opTab.addOperator(new ST_Buffer());
     opTab.addOperator(new ST_Intersection());
     opTab.addOperator(new ST_Union());
@@ -243,10 +250,12 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     HashSet<String> demangledNames = new HashSet<String>();
     for (Map.Entry<String, ExtensionFunction> extSig : extSigs.entrySet()) {
       final String demangledName = dropSuffix(extSig.getKey());
-      if (demangledNames.contains(demangledName)) {
+      final String demangledNameArity =
+              String.format("%s-%d", demangledName, extSig.getValue().getArgs().size());
+      if (demangledNames.contains(demangledNameArity)) {
         continue;
       }
-      demangledNames.add(demangledName);
+      demangledNames.add(demangledNameArity);
       opTab.addOperator(new ExtFunction(demangledName, extSig.getValue()));
     }
   }
@@ -356,14 +365,109 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
 
     @Override
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
-      assert opBinding.getOperandCount() == 2;
-      return opBinding.getCursorOperand(0);
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      java.util.List<RelDataType> typeList = new java.util.ArrayList<RelDataType>();
+      java.util.List<java.lang.String> fieldNameList =
+              new java.util.ArrayList<java.lang.String>();
+      fieldNameList.add("out0");
+      typeList.add(typeFactory.createSqlType(SqlTypeName.DOUBLE));
+      return typeFactory.createStructType(typeList, fieldNameList);
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
       java.util.List<SqlTypeFamily> sig_family = new java.util.ArrayList<SqlTypeFamily>();
       sig_family.add(SqlTypeFamily.CURSOR);
       sig_family.add(SqlTypeFamily.ANY);
+      return sig_family;
+    }
+  }
+
+  public static class RowAdder extends SqlFunction {
+    public RowAdder() {
+      super("ROW_ADDER",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.USER_DEFINED_TABLE_FUNCTION);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      java.util.List<RelDataType> typeList = new java.util.ArrayList<RelDataType>();
+      java.util.List<java.lang.String> fieldNameList =
+              new java.util.ArrayList<java.lang.String>();
+      fieldNameList.add("out_add");
+      typeList.add(typeFactory.createSqlType(SqlTypeName.DOUBLE));
+      return typeFactory.createStructType(typeList, fieldNameList);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> sig_family = new java.util.ArrayList<SqlTypeFamily>();
+      sig_family.add(SqlTypeFamily.INTEGER);
+      sig_family.add(SqlTypeFamily.CURSOR);
+      return sig_family;
+    }
+  }
+
+  public static class RowAddSub extends SqlFunction {
+    public RowAddSub() {
+      super("ROW_ADDSUB",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.USER_DEFINED_TABLE_FUNCTION);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      java.util.List<RelDataType> typeList = new java.util.ArrayList<RelDataType>();
+      java.util.List<java.lang.String> fieldNameList =
+              new java.util.ArrayList<java.lang.String>();
+      fieldNameList.add("out_add");
+      fieldNameList.add("out_sub");
+      typeList.add(typeFactory.createSqlType(SqlTypeName.DOUBLE));
+      typeList.add(typeFactory.createSqlType(SqlTypeName.DOUBLE));
+      return typeFactory.createStructType(typeList, fieldNameList);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> sig_family = new java.util.ArrayList<SqlTypeFamily>();
+      sig_family.add(SqlTypeFamily.INTEGER);
+      sig_family.add(SqlTypeFamily.CURSOR);
+      return sig_family;
+    }
+  }
+
+  public static class GetMaxWithRowOffset extends SqlFunction {
+    public GetMaxWithRowOffset() {
+      super("GET_MAX_WITH_ROW_OFFSET",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.USER_DEFINED_TABLE_FUNCTION);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      java.util.List<RelDataType> typeList = new java.util.ArrayList<RelDataType>();
+      java.util.List<java.lang.String> fieldNameList =
+              new java.util.ArrayList<java.lang.String>();
+      fieldNameList.add("out0");
+      fieldNameList.add("out1");
+      typeList.add(typeFactory.createSqlType(SqlTypeName.INTEGER));
+      typeList.add(typeFactory.createSqlType(SqlTypeName.INTEGER));
+      return typeFactory.createStructType(typeList, fieldNameList);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> sig_family = new java.util.ArrayList<SqlTypeFamily>();
+      sig_family.add(SqlTypeFamily.CURSOR);
       return sig_family;
     }
   }
@@ -1523,6 +1627,31 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     }
   }
 
+  static class ST_Centroid extends SqlFunction {
+    ST_Centroid() {
+      super("ST_Centroid",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 1;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> st_centroid_sig =
+              new java.util.ArrayList<SqlTypeFamily>();
+      st_centroid_sig.add(SqlTypeFamily.ANY);
+      return st_centroid_sig;
+    }
+  }
+
   static class ST_Buffer extends SqlFunction {
     ST_Buffer() {
       super("ST_Buffer",
@@ -1740,48 +1869,17 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
               SqlKind.OTHER_FUNCTION,
               null,
               null,
-              OperandTypes.family(toSqlSignature(sig)),
+              OperandTypes.family(sig.toSqlSignature()),
               sig.isRowUdf() ? SqlFunctionCategory.SYSTEM
                              : SqlFunctionCategory.USER_DEFINED_TABLE_FUNCTION);
       isRowUdf = sig.isRowUdf();
       if (isRowUdf) {
-        ret = toSqlTypeName(sig.getRet());
+        ret = sig.getSqlRet();
+        outs = null;
       } else {
         ret = null;
+        outs = sig.getSqlOuts();
       }
-    }
-
-    private static java.util.List<SqlTypeFamily> toSqlSignature(
-            final ExtensionFunction sig) {
-      java.util.List<SqlTypeFamily> sql_sig = new java.util.ArrayList<SqlTypeFamily>();
-      boolean isRowUdf = sig.isRowUdf();
-      for (int arg_idx = 0; arg_idx < sig.getArgs().size(); ++arg_idx) {
-        final ExtensionFunction.ExtArgumentType arg_type = sig.getArgs().get(arg_idx);
-        if (isRowUdf) {
-          sql_sig.add(toSqlTypeName(arg_type).getFamily());
-          if (isPointerType(arg_type)) {
-            ++arg_idx;
-          }
-        } else {
-          if (isPointerType(arg_type)) {
-            /* TODO: eliminate using getValueType */
-            sql_sig.add(toSqlTypeName(getValueType(arg_type)).getFamily());
-          } else {
-            sql_sig.add(toSqlTypeName(arg_type).getFamily());
-          }
-        }
-      }
-      return sql_sig;
-    }
-
-    private static boolean isPointerType(final ExtensionFunction.ExtArgumentType type) {
-      return type == ExtensionFunction.ExtArgumentType.PInt8
-              || type == ExtensionFunction.ExtArgumentType.PInt16
-              || type == ExtensionFunction.ExtArgumentType.PInt32
-              || type == ExtensionFunction.ExtArgumentType.PInt64
-              || type == ExtensionFunction.ExtArgumentType.PFloat
-              || type == ExtensionFunction.ExtArgumentType.PDouble
-              || type == ExtensionFunction.ExtArgumentType.PBool;
     }
 
     @Override
@@ -1791,81 +1889,23 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         return typeFactory.createTypeWithNullability(
                 typeFactory.createSqlType(ret), true);
       } else {
-        assert opBinding.getOperandCount() == 2;
-        return opBinding.getCursorOperand(0);
-      }
-    }
+        final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+        java.util.List<RelDataType> typeList = new java.util.ArrayList<RelDataType>();
+        java.util.List<java.lang.String> fieldNameList =
+                new java.util.ArrayList<java.lang.String>();
 
-    private static ExtensionFunction.ExtArgumentType getValueType(
-            final ExtensionFunction.ExtArgumentType type) {
-      switch (type) {
-        case PInt8:
-          return ExtensionFunction.ExtArgumentType.Int8;
-        case PInt16:
-          return ExtensionFunction.ExtArgumentType.Int16;
-        case PInt32:
-          return ExtensionFunction.ExtArgumentType.Int32;
-        case PInt64:
-          return ExtensionFunction.ExtArgumentType.Int64;
-        case PFloat:
-          return ExtensionFunction.ExtArgumentType.Float;
-        case PDouble:
-          return ExtensionFunction.ExtArgumentType.Double;
-        case PBool:
-          return ExtensionFunction.ExtArgumentType.Bool;
+        for (int out_idx = 0; out_idx < outs.size(); ++out_idx) {
+          // TODO: use the argument names of output columns as field names
+          fieldNameList.add("out" + out_idx);
+          typeList.add(typeFactory.createSqlType(outs.get(out_idx)));
+        }
+        return typeFactory.createStructType(typeList, fieldNameList);
       }
-      MAPDLOGGER.error("getValueType: no value for type " + type);
-      assert false;
-      return null;
-    }
-
-    private static SqlTypeName toSqlTypeName(
-            final ExtensionFunction.ExtArgumentType type) {
-      switch (type) {
-        case Bool:
-          return SqlTypeName.BOOLEAN;
-        case Int8:
-          return SqlTypeName.TINYINT;
-        case Int16:
-          return SqlTypeName.SMALLINT;
-        case Int32:
-          return SqlTypeName.INTEGER;
-        case Int64:
-          return SqlTypeName.BIGINT;
-        case Float:
-          return SqlTypeName.FLOAT;
-        case Double:
-          return SqlTypeName.DOUBLE;
-        case PInt8:
-        case PInt16:
-        case PInt32:
-        case PInt64:
-        case PFloat:
-        case PDouble:
-        case PBool:
-        case ArrayInt8:
-        case ArrayInt16:
-        case ArrayInt32:
-        case ArrayInt64:
-        case ArrayFloat:
-        case ArrayDouble:
-        case ArrayBool:
-          return SqlTypeName.ARRAY;
-        case GeoPoint:
-        case GeoLineString:
-        case GeoPolygon:
-        case GeoMultiPolygon:
-          return SqlTypeName.GEOMETRY;
-        case Cursor:
-          return SqlTypeName.CURSOR;
-      }
-      MAPDLOGGER.error("toSqlTypeName: unknown type " + type);
-      assert false;
-      return null;
     }
 
     private final boolean isRowUdf;
-    private final SqlTypeName ret;
+    private final SqlTypeName ret; // used only by UDFs
+    private final List<SqlTypeName> outs; // used only by UDTFs
   }
 
   //

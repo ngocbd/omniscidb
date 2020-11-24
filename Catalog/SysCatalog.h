@@ -42,10 +42,8 @@
 #include <vector>
 
 #include "Grantee.h"
-#include "LdapServer.h"
 #include "ObjectRoleDescriptor.h"
 #include "PkiServer.h"
-#include "RestServer.h"
 
 #include "../DataMgr/DataMgr.h"
 #include "../SqliteConnector/SqliteConnector.h"
@@ -300,6 +298,7 @@ class SysCatalog : private CommonFileOperations {
   std::unordered_map<std::string, std::vector<std::string>> getGranteesOfSharedDashboards(
       const std::vector<std::string>& dashboard_ids);
   void check_for_session_encryption(const std::string& pki_cert, std::string& session);
+  std::vector<std::shared_ptr<Catalog>> getCatalogsForAllDbs();
 
  private:
   using GranteeMap = std::map<std::string, Grantee*>;
@@ -321,6 +320,7 @@ class SysCatalog : private CommonFileOperations {
   void checkAndExecuteMigrations();
   void importDataFromOldMapdDB();
   void createUserRoles();
+  void addAdminUserRole();
   void migratePrivileges();
   void migratePrivileged_old();
   void updateUserSchema();
@@ -337,8 +337,7 @@ class SysCatalog : private CommonFileOperations {
 
   // Here go functions not wrapped into transactions (necessary for nested calls)
   void grantDefaultPrivilegesToRole_unsafe(const std::string& name, bool issuper);
-  void createRole_unsafe(const std::string& roleName,
-                         const bool& userPrivateRole = false);
+  void createRole_unsafe(const std::string& roleName, const bool userPrivateRole = false);
   void dropRole_unsafe(const std::string& roleName);
   void grantRoleBatch_unsafe(const std::vector<std::string>& roles,
                              const std::vector<std::string>& grantees);
@@ -375,6 +374,13 @@ class SysCatalog : private CommonFileOperations {
   bool isDashboardSystemRole(const std::string& roleName);
   void updateUserRoleName(const std::string& roleName, const std::string& newName);
 
+  /**
+   * For servers configured to use external authentication providers, determine whether
+   * users will be allowed to fallback to local login accounts. If no external providers
+   * are configured, returns true.
+   */
+  bool allowLocalLogin() const;
+
   template <typename F, typename... Args>
   void execInTransaction(F&& f, Args&&... args);
 
@@ -384,8 +390,6 @@ class SysCatalog : private CommonFileOperations {
   std::unique_ptr<SqliteConnector> sqliteConnector_;
 
   std::shared_ptr<Data_Namespace::DataMgr> dataMgr_;
-  std::unique_ptr<LdapServer> ldap_server_;
-  std::unique_ptr<RestServer> rest_server_;
   std::unique_ptr<PkiServer> pki_server_;
   const AuthMetadata* authMetadata_;
   std::shared_ptr<Calcite> calciteMgr_;

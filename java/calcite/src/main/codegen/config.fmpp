@@ -25,10 +25,18 @@ data: {
         "org.apache.calcite.sql.SqlDdl"
         "org.apache.calcite.sql.SqlCreate"
         "org.apache.calcite.sql.SqlDrop"
+        "org.apache.calcite.sql.SqlIdentifier"
+        "org.apache.calcite.sql.SqlNodeList"
+        "org.apache.calcite.schema.ColumnStrategy"
+        "com.mapd.parser.extension.ddl.omnisci.*"
+        "com.mapd.parser.extension.ddl.SqlDdlNodes"
+        "com.mapd.parser.extension.ddl.SqlCreateTable"
+        "com.mapd.parser.extension.ddl.SqlCreateView"
         "com.mapd.parser.extension.ddl.SqlCreateServer"
         "com.mapd.parser.extension.ddl.SqlDropServer"
         "com.mapd.parser.extension.ddl.SqlShowTables"
         "com.mapd.parser.extension.ddl.SqlAlterServer"
+        "com.mapd.parser.extension.ddl.SqlAlterForeignTable"
         "com.mapd.parser.extension.ddl.SqlCreateForeignTable"
         "com.mapd.parser.extension.ddl.SqlDropForeignTable"
         "com.mapd.parser.extension.ddl.SqlRefreshForeignTables"
@@ -36,6 +44,8 @@ data: {
         "com.mapd.parser.extension.ddl.SqlDropUserMapping"
         "com.mapd.parser.extension.ddl.SqlShowUserSessions"
         "com.mapd.parser.extension.ddl.SqlShowForeignServers"
+        "com.mapd.parser.extension.ddl.SqlShowQueries"
+        "com.mapd.parser.extension.ddl.SqlKillQuery"
         "com.mapd.parser.extension.ddl.omnisql.*"
         "java.util.Map"
         "java.util.HashMap"
@@ -61,6 +71,15 @@ data: {
         "MAPPING"
         "OWNER"
         "RENAME"
+        "KILL"
+        "QUERY"
+        "QUERIES"
+        "VIRTUAL"
+        "STORED"
+        "GEOGRAPHY"
+        "SHARD"
+        "SHARED"
+        "DICTIONARY"
       ]
 
       # List of keywords from "keywords" section that are not reserved.
@@ -283,6 +302,7 @@ data: {
         "SERVER_NAME"
         "SESSION"
         "SETS"
+        "SHARD"
         "SIMPLE"
         "SIZE"
         "SOURCE"
@@ -406,7 +426,10 @@ data: {
         "SqlShowDatabases(span())"
         "SqlShowForeignServers(span())"
         "SqlAlterServer(span())"
+        "SqlAlterForeignTable(span())"
         "SqlRefreshForeignTables(span())"
+        "SqlShowQueries(span())"
+        "SqlKillQuery(span())"
       ]
 
       # List of methods for parsing custom literals.
@@ -437,6 +460,8 @@ data: {
         "SqlCreateServer"
         "SqlCreateForeignTable"
         "SqlCreateUserMapping"
+        "SqlCreateTable"
+        "SqlCreateView"
       ]
 
       # List of methods for parsing extensions to "DROP" calls.
@@ -465,6 +490,8 @@ data: {
         "foreignTableParser.ftl"
         "showCommandsParser.ftl"
         "userMappingParser.ftl"
+        "interruptQueryParser.ftl"
+        "ddlParser.ftl"
       ]
 
       includePosixOperators: false

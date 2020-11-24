@@ -29,7 +29,7 @@
 #include "DataMgr/AbstractBuffer.h"
 #include "DataMgr/DataMgr.h"
 #include "LockMgr/LockMgr.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/thread_count.h"
 
@@ -164,16 +164,17 @@ void InsertOrderFragmenter::getChunkMetadata() {
     }
   }
 
-  ssize_t maxFixedColSize = 0;
+  size_t maxFixedColSize = 0;
 
   for (auto colIt = columnMap_.begin(); colIt != columnMap_.end(); ++colIt) {
-    ssize_t size = colIt->second.getColumnDesc()->columnType.get_size();
+    auto size = colIt->second.getColumnDesc()->columnType.get_size();
     if (size == -1) {  // variable length
       varLenColInfo_.insert(std::make_pair(colIt->first, 0));
       size = 8;  // b/c we use this for string and array indices - gross to have magic
                  // number here
     }
-    maxFixedColSize = std::max(maxFixedColSize, size);
+    CHECK_GE(size, 0);
+    maxFixedColSize = std::max(maxFixedColSize, static_cast<size_t>(size));
   }
 
   // this is maximum number of rows assuming everything is fixed length
@@ -259,6 +260,19 @@ void InsertOrderFragmenter::deleteFragments(const vector<int>& dropFragIds) {
   }
 }
 
+void InsertOrderFragmenter::updateColumnChunkMetadata(
+    const ColumnDescriptor* cd,
+    const int fragment_id,
+    const std::shared_ptr<ChunkMetadata> metadata) {
+  // synchronize concurrent accesses to fragmentInfoVec_
+  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
+
+  CHECK(metadata.get());
+  auto fragment_info = getFragmentInfo(fragment_id);
+  CHECK(fragment_info);
+  fragment_info->setChunkMetadata(cd->columnId, metadata);
+}
+
 void InsertOrderFragmenter::updateChunkStats(
     const ColumnDescriptor* cd,
     std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map) {
@@ -296,10 +310,10 @@ void InsertOrderFragmenter::updateChunkStats(
                                              chunk_meta_it->second->numElements);
       auto buf = chunk->getBuffer();
       CHECK(buf);
-      auto encoder = buf->encoder.get();
-      if (!encoder) {
-        throw std::runtime_error("No encoder for chunk " + showChunk(chunk_key));
+      if (!buf->hasEncoder()) {
+        throw std::runtime_error("No encoder for chunk " + show_chunk(chunk_key));
       }
+      auto encoder = buf->getEncoder();
 
       auto chunk_stats = stats_itr->second;
 
@@ -313,7 +327,7 @@ void InsertOrderFragmenter::updateChunkStats(
                                   ? SQLTypeInfo(kBIGINT)
                                   : get_logical_type_info(cd->columnType);
       if (!didResetStats) {
-        VLOG(3) << "Skipping chunk stats reset for " << showChunk(chunk_key);
+        VLOG(3) << "Skipping chunk stats reset for " << show_chunk(chunk_key);
         VLOG(3) << "Max: " << DatumToString(old_chunk_stats.max, logical_ti) << " -> "
                 << DatumToString(chunk_stats.max, logical_ti);
         VLOG(3) << "Min: " << DatumToString(old_chunk_stats.min, logical_ti) << " -> "
@@ -322,7 +336,7 @@ void InsertOrderFragmenter::updateChunkStats(
         continue;  // move to next fragment
       }
 
-      VLOG(2) << "Resetting chunk stats for " << showChunk(chunk_key);
+      VLOG(2) << "Resetting chunk stats for " << show_chunk(chunk_key);
       VLOG(2) << "Max: " << DatumToString(old_chunk_stats.max, logical_ti) << " -> "
               << DatumToString(chunk_stats.max, logical_ti);
       VLOG(2) << "Min: " << DatumToString(old_chunk_stats.min, logical_ti) << " -> "
@@ -375,14 +389,13 @@ void InsertOrderFragmenter::insertData(InsertData& insertDataStruct) {
           chunkKeyPrefix_[1]);  // need to checkpoint here to remove window for corruption
     }
   } catch (...) {
-    int32_t tableEpoch =
-        catalog_->getTableEpoch(insertDataStruct.databaseId, insertDataStruct.tableId);
+    auto table_epochs =
+        catalog_->getTableEpochs(insertDataStruct.databaseId, insertDataStruct.tableId);
 
     // the statement below deletes *this* object!
     // relying on exception propagation at this stage
     // until we can sort this out in a cleaner fashion
-    catalog_->setTableEpoch(
-        insertDataStruct.databaseId, insertDataStruct.tableId, tableEpoch);
+    catalog_->setTableEpochs(insertDataStruct.databaseId, table_epochs);
     throw;
   }
 }

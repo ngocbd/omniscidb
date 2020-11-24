@@ -118,7 +118,6 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   void init();
 
-  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec) override;
   void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
                                        const ChunkKey& keyPrefix) override {
     return getFileMgr(keyPrefix)->getChunkMetadataVecForKeyPrefix(chunkMetadataVec,
@@ -163,6 +162,12 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
   void setTableEpoch(const int db_id, const int tb_id, const int start_epoch);
   size_t getTableEpoch(const int db_id, const int tb_id);
 
+  // For testing purposes only
+  std::shared_ptr<FileMgr> getSharedFileMgr(const int db_id, const int table_id);
+
+  // For testing purposes only
+  void setFileMgr(const int db_id, const int table_id, std::shared_ptr<FileMgr> file_mgr);
+
  private:
   std::string basePath_;       /// The OS file system path containing the files.
   size_t num_reader_threads_;  /// number of threads used when loading data
@@ -182,7 +187,7 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
   bool dbConvert_;  /// true if conversion should be done between different
                     /// "mapd_db_version_"
 
-  std::map<std::pair<int, int>, std::shared_ptr<AbstractBufferMgr>> ownedFileMgrs_;
+  std::map<std::pair<int, int>, std::shared_ptr<FileMgr>> ownedFileMgrs_;
   std::map<std::pair<int, int>, AbstractBufferMgr*> allFileMgrs_;
 
   mapd_shared_mutex fileMgrs_mutex_;

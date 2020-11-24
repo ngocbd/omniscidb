@@ -143,8 +143,9 @@ void validate_non_duplicate_column(const std::string& column_name,
 
 void validate_non_reserved_keyword(const std::string& column_name);
 
-void validate_drop_table_type(const TableDescriptor* td,
-                              const TableType expected_table_type);
+void validate_table_type(const TableDescriptor* td,
+                         const TableType expected_table_type,
+                         const std::string& command);
 
 std::string table_type_enum_to_string(const TableType table_type);
 
@@ -152,11 +153,14 @@ std::string table_type_enum_to_string(const TableType table_type);
  * Validates that the given file path is allowed. Validation entails ensuring
  * that given path is not under a blacklisted root path and path is under a
  * whitelisted path, if whitelisted paths have been configured.
+ * Also excludes the use of spaces and punctuation other than: . / _ + - = :
  *
  * @param file_path - file path to validate
  * @param data_transfer_type - enum indicating whether validation is for an import or
  * export use case
+ * @param allow_wildcards - bool indicating if wildcards are allowed
  */
 void validate_allowed_file_path(const std::string& file_path,
-                                const DataTransferType data_transfer_type);
+                                const DataTransferType data_transfer_type,
+                                const bool allow_wildcards = false);
 }  // namespace ddl_utils

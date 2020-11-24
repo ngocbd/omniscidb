@@ -20,8 +20,7 @@
 
 #include "Catalog/Catalog.h"
 #include "Catalog/SysCatalog.h"
-#include "DataMgr/ForeignStorage/CsvDataWrapper.h"
-#include "DataMgr/ForeignStorage/ParquetDataWrapper.h"
+#include "DataMgr/ForeignStorage/ForeignTableRefresh.h"
 #include "LockMgr/LockMgr.h"
 #include "Parser/ParserNode.h"
 #include "Shared/StringTransform.h"
@@ -60,6 +59,7 @@ DdlCommandExecutor::DdlCommandExecutor(
     std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr)
     : session_ptr_(session_ptr) {
   CHECK(!ddl_statement.empty());
+  VLOG(2) << "Parsing JSON DDL from Calcite: " << ddl_statement;
   ddl_query_.Parse(ddl_statement);
   CHECK(ddl_query_.IsObject());
   CHECK(ddl_query_.HasMember("payload"));
@@ -72,6 +72,25 @@ DdlCommandExecutor::DdlCommandExecutor(
 void DdlCommandExecutor::execute(TQueryResult& _return) {
   const auto& payload = ddl_query_["payload"].GetObject();
   const auto& ddl_command = std::string_view(payload["command"].GetString());
+
+  // the following commands use parser node locking to ensure safe concurrent access
+  if (ddl_command == "CREATE_TABLE") {
+    auto create_table_stmt = Parser::CreateTableStmt(payload);
+    create_table_stmt.execute(*session_ptr_);
+    return;
+  } else if (ddl_command == "CREATE_VIEW") {
+    auto create_view_stmt = Parser::CreateViewStmt(payload);
+    create_view_stmt.execute(*session_ptr_);
+    return;
+  }
+
+  // the following commands require a global unique lock until proper table locking has
+  // been implemented and/or verified
+  auto execute_write_lock = mapd_unique_lock<mapd_shared_mutex>(
+      *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
+          legacylockmgr::ExecutorOuterLock, true));
+  // TODO(vancouver): add appropriate table locking
+
   if (ddl_command == "CREATE_SERVER") {
     CreateForeignServerCommand{payload, session_ptr_}.execute(_return);
   } else if (ddl_command == "DROP_SERVER") {
@@ -88,8 +107,20 @@ void DdlCommandExecutor::execute(TQueryResult& _return) {
     ShowForeignServersCommand{payload, session_ptr_}.execute(_return);
   } else if (ddl_command == "ALTER_SERVER") {
     AlterForeignServerCommand{payload, session_ptr_}.execute(_return);
+  } else if (ddl_command == "ALTER_FOREIGN_TABLE") {
+    AlterForeignTableCommand{payload, session_ptr_}.execute(_return);
   } else if (ddl_command == "REFRESH_FOREIGN_TABLES") {
     RefreshForeignTablesCommand{payload, session_ptr_}.execute(_return);
+  } else if (ddl_command == "SHOW_QUERIES") {
+    LOG(ERROR) << "SHOW QUERIES DDL is not ready yet!\n";
+  } else if (ddl_command == "KILL_QUERY") {
+    CHECK(payload.HasMember("querySession"));
+    const std::string& querySessionPayload = payload["querySession"].GetString();
+    auto querySession = querySessionPayload.substr(1, 8);
+    CHECK_EQ(querySession.length(),
+             (unsigned long)8);  // public_session_id's length + two quotes
+    LOG(ERROR) << "TRY TO KILL QUERY " << querySession
+               << " BUT KILL QUERY DDL is not ready yet!\n";
   } else {
     throw std::runtime_error("Unsupported DDL command");
   }
@@ -99,6 +130,35 @@ bool DdlCommandExecutor::isShowUserSessions() {
   const auto& payload = ddl_query_["payload"].GetObject();
   const auto& ddl_command = std::string_view(payload["command"].GetString());
   return (ddl_command == "SHOW_USER_SESSIONS");
+}
+
+bool DdlCommandExecutor::isShowQueries() {
+  const auto& payload = ddl_query_["payload"].GetObject();
+  const auto& ddl_command = std::string_view(payload["command"].GetString());
+  return (ddl_command == "SHOW_QUERIES");
+}
+
+bool DdlCommandExecutor::isKillQuery() {
+  const auto& payload = ddl_query_["payload"].GetObject();
+  const auto& ddl_command = std::string_view(payload["command"].GetString());
+  return (ddl_command == "KILL_QUERY");
+}
+
+const std::string DdlCommandExecutor::getTargetQuerySessionToKill() {
+  // caller should check whether DDL indicates KillQuery request
+  // i.e., use isKillQuery() before calling this function
+  const auto& payload = ddl_query_["payload"].GetObject();
+  CHECK(isKillQuery());
+  CHECK(payload.HasMember("querySession"));
+  const std::string& query_session = payload["querySession"].GetString();
+  // regex matcher for public_session: start_time{3}-session_id{4} (Example:819-4RDo)
+  boost::regex session_id_regex{R"([0-9]{3}-[a-zA-Z0-9]{4})",
+                                boost::regex::extended | boost::regex::icase};
+  if (!boost::regex_match(query_session, session_id_regex)) {
+    throw std::runtime_error(
+        "Please provide the correct session ID of the query that you want to interrupt.");
+  }
+  return query_session;
 }
 
 CreateForeignServerCommand::CreateForeignServerCommand(
@@ -539,15 +599,7 @@ void CreateForeignTableCommand::setTableDetails(const std::string& table_name,
 
   if (ddl_payload_.HasMember("options") && !ddl_payload_["options"].IsNull()) {
     CHECK(ddl_payload_["options"].IsObject());
-    foreign_table.populateOptionsMap(ddl_payload_["options"]);
-
-    if (foreign_table.foreign_server->data_wrapper_type ==
-        foreign_storage::DataWrapperType::CSV) {
-      foreign_storage::CsvDataWrapper::validateOptions(&foreign_table);
-    } else if (foreign_table.foreign_server->data_wrapper_type ==
-               foreign_storage::DataWrapperType::PARQUET) {
-      foreign_storage::ParquetDataWrapper::validateOptions(&foreign_table);
-    }
+    foreign_table.initializeOptions(ddl_payload_["options"]);
   }
 
   if (const auto it = foreign_table.options.find("FRAGMENT_SIZE");
@@ -608,6 +660,7 @@ void DropForeignTableCommand::execute(TQueryResult& _return) {
         std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>>(
             lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>::acquireTableDescriptor(
                 catalog, table_name, false));
+    CHECK(td_with_lock);
     td = (*td_with_lock)();
   } catch (const std::runtime_error& e) {
     if (ddl_payload_["ifExists"].GetBool()) {
@@ -618,7 +671,6 @@ void DropForeignTableCommand::execute(TQueryResult& _return) {
   }
 
   CHECK(td);
-  CHECK(td_with_lock);
 
   if (!session_ptr_->checkDBAccessPrivileges(
           DBObjectType::TableDBObjectType, AccessPrivileges::DROP_TABLE, table_name)) {
@@ -627,7 +679,7 @@ void DropForeignTableCommand::execute(TQueryResult& _return) {
         "\" will not be dropped. User has no DROP TABLE privileges.");
   }
 
-  ddl_utils::validate_drop_table_type(td, ddl_utils::TableType::FOREIGN_TABLE);
+  ddl_utils::validate_table_type(td, ddl_utils::TableType::FOREIGN_TABLE, "DROP");
   auto table_data_write_lock =
       lockmgr::TableDataLockMgr::getWriteLockForTable(catalog, table_name);
   catalog.dropTable(td);
@@ -733,18 +785,99 @@ RefreshForeignTablesCommand::RefreshForeignTablesCommand(
     : DdlCommand(ddl_payload, session_ptr) {
   CHECK(ddl_payload.HasMember("tableNames"));
   CHECK(ddl_payload["tableNames"].IsArray());
-  for (auto const& tableName_def : ddl_payload["tableNames"].GetArray()) {
-    CHECK(tableName_def.IsString());
+  for (auto const& tablename_def : ddl_payload["tableNames"].GetArray()) {
+    CHECK(tablename_def.IsString());
   }
 }
 
 void RefreshForeignTablesCommand::execute(TQueryResult& _return) {
+  bool evict_cached_entries{false};
   foreign_storage::OptionsContainer opt;
   if (ddl_payload_.HasMember("options") && !ddl_payload_["options"].IsNull()) {
     opt.populateOptionsMap(ddl_payload_["options"]);
+    for (const auto& entry : opt.options) {
+      if (entry.first != "EVICT") {
+        throw std::runtime_error{
+            "Invalid option \"" + entry.first +
+            "\" provided for refresh command. Only \"EVICT\" option is supported."};
+      }
+    }
     CHECK(opt.options.find("EVICT") != opt.options.end());
-    CHECK(boost::iequals(opt.options["EVICT"], "true") ||
-          boost::iequals(opt.options["EVICT"], "false"));
+
+    if (boost::iequals(opt.options["EVICT"], "true") ||
+        boost::iequals(opt.options["EVICT"], "false")) {
+      if (boost::iequals(opt.options["EVICT"], "true")) {
+        evict_cached_entries = true;
+      }
+    } else {
+      throw std::runtime_error{
+          "Invalid value \"" + opt.options["EVICT"] +
+          "\" provided for EVICT option. Value must be either \"true\" or \"false\"."};
+    }
   }
-  throw std::runtime_error("REFRESH FOREIGN TABLES is not yet implemented");
+
+  auto& cat = session_ptr_->getCatalog();
+  const auto& current_user = session_ptr_->get_currentUser();
+  /* verify object ownership if not suser */
+  if (!current_user.isSuper) {
+    for (const auto& table_name_json : ddl_payload_["tableNames"].GetArray()) {
+      std::string table_name = table_name_json.GetString();
+      if (!Catalog_Namespace::SysCatalog::instance().verifyDBObjectOwnership(
+              current_user, DBObject(table_name, TableDBObjectType), cat)) {
+        throw std::runtime_error(
+            std::string("REFRESH FOREIGN TABLES failed on table \"") + table_name +
+            "\". It can only be executed by super user or "
+            "owner of the "
+            "object.");
+      }
+    }
+  }
+
+  for (const auto& table_name_json : ddl_payload_["tableNames"].GetArray()) {
+    std::string table_name = table_name_json.GetString();
+    foreign_storage::refresh_foreign_table(cat, table_name, evict_cached_entries);
+  }
+}
+
+AlterForeignTableCommand::AlterForeignTableCommand(
+    const rapidjson::Value& ddl_payload,
+    std::shared_ptr<const Catalog_Namespace::SessionInfo> session_ptr)
+    : DdlCommand(ddl_payload, session_ptr) {
+  CHECK(ddl_payload.HasMember("tableName"));
+  CHECK(ddl_payload["tableName"].IsString());
+  CHECK(ddl_payload.HasMember("options"));
+  CHECK(ddl_payload["options"].IsObject());
+}
+
+void AlterForeignTableCommand::execute(TQueryResult& _return) {
+  auto& catalog = session_ptr_->getCatalog();
+  const std::string& table_name = ddl_payload_["tableName"].GetString();
+  const TableDescriptor* td{nullptr};
+  std::unique_ptr<lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>> td_with_lock;
+
+  td_with_lock = std::make_unique<lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>>(
+      lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>::acquireTableDescriptor(
+          catalog, table_name, false));
+  CHECK(td_with_lock);
+  td = (*td_with_lock)();
+  CHECK(td);
+
+  ddl_utils::validate_table_type(td, ddl_utils::TableType::FOREIGN_TABLE, "ALTER");
+
+  if (!session_ptr_->checkDBAccessPrivileges(
+          DBObjectType::TableDBObjectType, AccessPrivileges::ALTER_TABLE, table_name)) {
+    throw std::runtime_error(
+        "Current user does not have the privilege to alter foreign table: " + table_name);
+  }
+
+  auto table_data_write_lock =
+      lockmgr::TableDataLockMgr::getWriteLockForTable(catalog, table_name);
+
+  auto new_options_map =
+      foreign_storage::ForeignTable::create_options_map(ddl_payload_["options"]);
+  auto table = dynamic_cast<const foreign_storage::ForeignTable*>(td);
+  CHECK(table);
+  table->validateSupportedOptions(new_options_map);
+  foreign_storage::ForeignTable::validate_alter_options(new_options_map);
+  catalog.setForeignTableOptions(table_name, new_options_map, false);
 }

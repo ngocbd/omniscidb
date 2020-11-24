@@ -29,10 +29,10 @@
 #include <string>
 
 #include "DateConverters.h"
-#include "Logger.h"
+#include "DateTimeParser.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/DateTimeUtils.h"
 #include "StringTransform.h"
-#include "TimeGM.h"
 #include "misc.h"
 #include "sqltypes.h"
 
@@ -92,17 +92,17 @@ int64_t parse_numeric(const std::string_view s, SQLTypeInfo& ti) {
   }
   if (ti.get_dimension() == 0) {
     // set the type info based on the literal string
-    ti.set_scale(after_dot.length());
-    ti.set_dimension(before_dot_digits + ti.get_scale());
+    ti.set_scale(static_cast<int>(after_dot.length()));
+    ti.set_dimension(static_cast<int>(before_dot_digits + ti.get_scale()));
     ti.set_notnull(false);
   } else {
+    CHECK_GE(ti.get_scale(), 0);
     if (before_dot_digits + ti.get_scale() > static_cast<size_t>(ti.get_dimension())) {
       throw std::runtime_error("numeric value " + std::string(s) +
                                " exceeds the maximum precision of " +
                                std::to_string(ti.get_dimension()));
     }
-    for (ssize_t i = 0; i < static_cast<ssize_t>(after_dot.length()) - ti.get_scale();
-         i++) {
+    for (size_t i = static_cast<size_t>(ti.get_scale()); i < after_dot.length(); ++i) {
       fraction /= 10;  // truncate the digits after decimal point.
     }
   }
@@ -161,14 +161,13 @@ Datum StringToDatum(std::string_view s, SQLTypeInfo& ti) {
         d.doubleval = std::stod(std::string(s));
         break;
       case kTIME:
-        d.bigintval = DateTimeStringValidate<kTIME>()(std::string(s), ti.get_dimension());
+        d.bigintval = dateTimeParse<kTIME>(s, ti.get_dimension());
         break;
       case kTIMESTAMP:
-        d.bigintval =
-            DateTimeStringValidate<kTIMESTAMP>()(std::string(s), ti.get_dimension());
+        d.bigintval = dateTimeParse<kTIMESTAMP>(s, ti.get_dimension());
         break;
       case kDATE:
-        d.bigintval = DateTimeStringValidate<kDATE>()(std::string(s), ti.get_dimension());
+        d.bigintval = dateTimeParse<kDATE>(s, ti.get_dimension());
         break;
       case kPOINT:
       case kLINESTRING:
@@ -214,8 +213,18 @@ bool DatumEqual(const Datum a, const Datum b, const SQLTypeInfo& ti) {
     case kTEXT:
     case kVARCHAR:
     case kCHAR:
+    case kPOINT:
+    case kLINESTRING:
+    case kPOLYGON:
+    case kMULTIPOLYGON:
       if (ti.get_compression() == kENCODING_DICT) {
         return a.intval == b.intval;
+      }
+      if (a.stringval == nullptr && b.stringval == nullptr) {
+        return true;
+      }
+      if (a.stringval == nullptr || b.stringval == nullptr) {
+        return false;
       }
       return *a.stringval == *b.stringval;
     default:
@@ -228,9 +237,8 @@ bool DatumEqual(const Datum a, const Datum b, const SQLTypeInfo& ti) {
  * @brief convert datum to string
  */
 std::string DatumToString(Datum d, const SQLTypeInfo& ti) {
-  constexpr size_t buf_size = 32;
+  constexpr size_t buf_size = 64;
   char buf[buf_size];  // Hold "2000-03-01 12:34:56.123456789" and large years.
-  static_assert(sizeof(int64_t) <= sizeof(time_t));
   switch (ti.get_type()) {
     case kBOOLEAN:
       if (d.boolval) {
@@ -239,11 +247,11 @@ std::string DatumToString(Datum d, const SQLTypeInfo& ti) {
       return "f";
     case kNUMERIC:
     case kDECIMAL: {
-      // we need to consider buf_size including the scale and null terminator
-      char str[ti.get_dimension() + ti.get_scale() + 2];
       double v = (double)d.bigintval / pow(10, ti.get_scale());
-      sprintf(str, "%*.*f", ti.get_dimension(), ti.get_scale(), v);
-      return std::string(str);
+      int size = snprintf(buf, buf_size, "%*.*f", ti.get_dimension(), ti.get_scale(), v);
+      CHECK_LE(0, size) << v << ' ' << ti.to_string();
+      CHECK_LT(size_t(size), buf_size) << v << ' ' << ti.to_string();
+      return buf;
     }
     case kINT:
       return std::to_string(d.intval);
@@ -258,40 +266,20 @@ std::string DatumToString(Datum d, const SQLTypeInfo& ti) {
     case kDOUBLE:
       return std::to_string(d.doubleval);
     case kTIME: {
-      std::tm tm_struct;
-      gmtime_r(reinterpret_cast<time_t*>(&d.bigintval), &tm_struct);
-      strftime(buf, buf_size, "%T", &tm_struct);
-      return std::string(buf);
+      size_t const len = shared::formatHMS(buf, buf_size, d.bigintval);
+      CHECK_EQ(8u, len);  // 8 == strlen("HH:MM:SS")
+      return buf;
     }
     case kTIMESTAMP: {
-      std::tm tm_struct;
-      if (ti.is_high_precision_timestamp()) {
-        auto scale = DateTimeUtils::get_timestamp_precision_scale(ti.get_dimension());
-        time_t const sec = static_cast<time_t>(floor_div(d.bigintval, scale));
-        int const frac = unsigned_mod(d.bigintval, scale);
-        gmtime_r(&sec, &tm_struct);
-        size_t const datetime_len = shared::formatDateTime(buf, buf_size, &tm_struct);
-        CHECK_LE(19u, datetime_len);         // 19 == strlen("YYYY-MM-DD HH:MM:SS")
-        constexpr size_t max_frac_len = 10;  // == strlen(".123456789")
-        CHECK_LT(datetime_len + max_frac_len, buf_size);
-        int const frac_len = snprintf(
-            buf + datetime_len, max_frac_len + 1, ".%0*d", ti.get_dimension(), frac);
-        CHECK_EQ(frac_len, 1 + ti.get_dimension());
-      } else {
-        time_t const sec = static_cast<time_t>(d.bigintval);
-        gmtime_r(&sec, &tm_struct);
-        size_t const datetime_len = shared::formatDateTime(buf, buf_size, &tm_struct);
-        CHECK_LT(0u, datetime_len);
-      }
+      unsigned const dim = ti.get_dimension();  // assumes dim <= 9
+      size_t const len = shared::formatDateTime(buf, buf_size, d.bigintval, dim);
+      CHECK_LE(19u + bool(dim) + dim, len);  // 19 = strlen("YYYY-MM-DD HH:MM:SS")
       return buf;
     }
     case kDATE: {
-      std::tm tm_struct;
-      time_t ntimeval = static_cast<time_t>(d.bigintval);
-      gmtime_r(&ntimeval, &tm_struct);
-      size_t const date_len = shared::formatDate(buf, buf_size, &tm_struct);
-      CHECK_LE(10u, date_len);  // 10 == strlen("YYYY-MM-DD")
-      return std::string(buf);
+      size_t const len = shared::formatDate(buf, buf_size, d.bigintval);
+      CHECK_LE(10u, len);  // 10 == strlen("YYYY-MM-DD")
+      return buf;
     }
     case kINTERVAL_DAY_TIME:
       return std::to_string(d.bigintval) + " ms (day-time interval)";
@@ -300,6 +288,9 @@ std::string DatumToString(Datum d, const SQLTypeInfo& ti) {
     case kTEXT:
     case kVARCHAR:
     case kCHAR:
+      if (d.stringval == nullptr) {
+        return "NULL";
+      }
       return *d.stringval;
     default:
       throw std::runtime_error("Internal error: invalid type " + ti.get_type_name() +
